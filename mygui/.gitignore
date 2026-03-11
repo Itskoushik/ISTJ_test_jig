@@ -1,0 +1,44 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+#__pycache__/
+
+# Ignore venv internals
+Scripts/
+bin/
+share/
+include/
+lib/
+lib64/
+typings/
+other codes/
+pyvenv.cfg
+build/
+
+
+# Ignore compiled Python files
+*.pyc
+*.pyo
+*.db
+*.spec
+__pycache__/
+
+
+# Ignore installer/executable/readme files
+*.iss
+*.exe
+README.txt
+
+# Allow Python source files (explicitly not ignored)
+!*.py
+
+# Allow image files
+!*.png
+!*.jpg
+!*.jpeg
+!*.gif
+!*.svg
+!*.webp
+!*.ico
+!*.bmp
+
+# Allow folders (git tracks folders via their contents, so this is implicit)
+# Just make sure not to ignore folder contents above
