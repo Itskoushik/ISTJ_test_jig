@@ -39,6 +39,9 @@ from tests import (
     jb_seq
 )
 
+from devices.apx_analyzer import configure_apx,generator_control
+
+
 
 class PSUAutomationThread(QThread):
     def __init__(self, screen):
@@ -600,6 +603,10 @@ class FullTestScreen(QMainWindow):
         self.start_btn.setFont(QFont("Arial", 10, QFont.Bold))
         self.start_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.start_btn.setStyleSheet("""
+            QPushButton:disabled {
+                background-color: #9e9e9e;
+                color: #e0e0e0;
+            }
             QPushButton {
                 background-color: #2e7d32;
                 color: white;
@@ -879,23 +886,17 @@ class FullTestScreen(QMainWindow):
     # STEP 2: PSU AUTOMATION METHODS (DP832 DATASHEET COMPLIANT)
     # ========================================================================
     from psu.psu_helpers import find_psu
-
-    def psu_send_command(self, command: str) -> str:
-        print("Command received:", command)
-        return ""
-
   
     def psu_send_command(self, command: str) -> str:
+
         try:
-            if not self.psu_inst:
-                self.psu_inst = self.find_psu()
 
             if not self.psu_inst:
-                self.log_signal.emit("ERROR: PSU not found", True)
+                self.log_signal.emit("ERROR: PSU not initialized", True)
                 return ""
 
-            # 🔒 THREAD-SAFE VISA ACCESS
             with self.psu_lock:
+
                 if "?" in command:
                     return self.psu_inst.query(command).strip()
                 else:
@@ -903,17 +904,21 @@ class FullTestScreen(QMainWindow):
                     return ""
 
         except Exception as e:
-            self.log_signal.emit(f"PSU COMMUNICATION LOST: {e}", True)
 
-            QTimer.singleShot(
-                0,
-                lambda: self.on_device_disconnected(
-                    DeviceType.PSU,
-                    "Power Supply communication lost.\nTest aborted."
+            if not self._disconnect_in_progress:
+                self._disconnect_in_progress = True
+
+                self.log_signal.emit(f"PSU COMMUNICATION LOST: {e}", True)
+
+                QTimer.singleShot(
+                    0,
+                    lambda: self.on_device_disconnected(
+                        DeviceType.PSU,
+                        "Power Supply communication lost.\nTest aborted."
+                    )
                 )
-            )
-            raise   # 🔥 HARD STOP CURRENT EXECUTION
 
+            return ""
 
 
     def freeze_psu_front_panel(self):
@@ -966,12 +971,12 @@ class FullTestScreen(QMainWindow):
         self.current_channel = 1
         self.log_signal.emit("Ch1 OUTPUT ON (28V, 1.3A)", False)
         self.operator_event.clear()
-        self.show_popup_signal.emit(
-            "Channel 1 Active",
-            "Channel 1 is ON at 28V.\nClick OK to proceed.",
-            None,"ok",None
-        )
-        self.operator_event.wait()
+        # self.show_popup_signal.emit(
+        #     "Channel 1 Active",
+        #     "Channel 1 is ON at 28V.\nClick OK to proceed.",
+        #     None,"ok",None
+        # )
+        # self.operator_event.wait()
         self.log_signal.emit("Operator confirmed Channel 1", False)
         time.sleep(15)
 
@@ -1310,8 +1315,14 @@ class FullTestScreen(QMainWindow):
 
     def run_psu_automation_no_jbox(self):
         try:
-            self.test_running = True
+            
+            if not self.psu_inst:
+                self.psu_inst = self.find_psu()
 
+            if not self.psu_inst:
+                self.log_signal.emit("ERROR: PSU not found", True)
+                return
+            self.test_running = True
             # 🔑 Enter REMOTE mode ONCE
             self.psu_send_command("SYST:REM")
             time.sleep(0.2)
@@ -1351,8 +1362,8 @@ class FullTestScreen(QMainWindow):
             # time.sleep(1)
 
             # 🔓 Unlock PSU
-            self.unfreeze_psu_front_panel()
-            time.sleep(0.3)
+            # self.unfreeze_psu_front_panel()
+            # time.sleep(0.3)
 
 
             #ggs
@@ -1395,8 +1406,10 @@ class FullTestScreen(QMainWindow):
             QApplication.processEvents()
             time.sleep(0.5)
             self.check_abort()
-            
-            
+
+            configure_apx(self)
+            generator_control(self, level="750.0 uVrms", frequency=1000,state="on")
+
             self.log_signal.emit("Step 10: Setting Switch (S24) NORM to ON.  ", False)
             QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
@@ -1442,20 +1455,28 @@ class FullTestScreen(QMainWindow):
             time.sleep(2)
 
 
-            self.log_signal.emit("✓ PSU automation COMPLETED", False)
 
-            # ✅ Normal mode → show calibration popup
-            calibration = CalibrationPopup(self)
-            if calibration.exec_() == QDialog.Accepted:
-                self.abort_event.clear()
-                self.test_running = True
-                self.logger.log("Calibration acknowledged - Starting test initialization", False)
-                self.log_text.clear()
+            # 🛑 PAUSE POINT – Operator Setup Instructions
+            self.operator_event.clear()
 
-                # ✅ Run initialization in background thread
-                self.init_thread = InitializationThread(self)
-                self.init_thread.start()
-                time.sleep(0.5)
+            self.show_popup_signal.emit(
+                "⚠ Operator Setup Required",
+                "• Connect cables J65 to J101 and J66 to J102.\n"
+                "• Turn the ICS knobs fully CW.\n"
+                "• Set MIC Mode to HOT.\n"
+                "• Turn TX SEL knobs fully CCW and to the OUT position.\n"
+                "• Turn RX SEL knobs fully CCW.\n"
+                "• Set STBY/NORM switch to NORM position.",
+                RESOURCES_DIR / "knob.png",  # optional image
+                "ok",
+                None
+            )
+
+            # ⏸ Wait for operator confirmation
+            self.operator_event.wait()
+
+            time.sleep(2)
+
             self.log_signal.emit("========== INITIALIZATION START ==========", False)
             time.sleep(1)
             self.log_signal.emit("Switching all Relays to Default state", False)
@@ -1536,6 +1557,7 @@ class FullTestScreen(QMainWindow):
             self.logger.log("# WRITE SCPI LOGIC HERE", False)
             time.sleep(0.5)
             self.check_abort()
+            self.worker_channel_1()
             
             self.log_signal.emit("Step 7: Live voltage monitoring enabled", False)
 
@@ -1578,6 +1600,7 @@ class FullTestScreen(QMainWindow):
             QApplication.processEvents()
             time.sleep(0.5)
             self.check_abort()
+            
             
             
             
@@ -1774,6 +1797,8 @@ class FullTestScreen(QMainWindow):
             return
         # Disable lock button once test starts
         self.lock_btn.setEnabled(False)
+        # 🔒 Disable start button once test begins
+        self.start_btn.setEnabled(False)
         model = self.alhx_combo.currentText().strip()
         now = datetime.now()
         # ==========================================================
@@ -1910,6 +1935,15 @@ class FullTestScreen(QMainWindow):
 
         
     def show_test_completion(self):
+        # 🔴 TURN OFF PSU OUTPUT IMMEDIATELY
+        try:
+            if self.psu_inst:
+                with self.psu_lock:
+                    self.psu_inst.write("OUTP OFF")
+                self.log_signal.emit("⚠ PSU OUTPUT TURNED OFF (Abort)", True)
+        except Exception as e:
+            self.log_signal.emit(f"PSU OFF failed during abort: {e}", True)
+        self.start_btn.setEnabled(True)
         completion = TestCompletionModal(self)
         completion.exec_()
             # ================= WRITE RESULT =================
@@ -1990,27 +2024,39 @@ class FullTestScreen(QMainWindow):
 
     def abort_test_internal(self):
         """Forcefully abort running test + cleanup"""
+
+        # 🔴 TURN OFF PSU OUTPUT IMMEDIATELY
+        try:
+            if self.psu_inst:
+                with self.psu_lock:
+                    self.psu_inst.write("OUTP OFF")
+                self.log_signal.emit("⚠ PSU OUTPUT TURNED OFF (Abort)", True)
+        except Exception as e:
+            self.log_signal.emit(f"PSU OFF failed during abort: {e}", True)
+        
+
         # 🔥 FORCE SAVE CURRENT REPORT
         try:
             finalize_report()
         except:
             pass
-        self.test_running = False
-        
 
-        # ✅ Release any operator waits
+        self.test_running = False
+        self.start_btn.setEnabled(True)
+
+        # Release any operator waits
         try:
             self.operator_event.set()
         except Exception:
             pass
 
-        # ✅ Stop monitoring + listeners
+        # Stop monitoring
         try:
             self.stop_voltage_monitoring()
         except Exception:
             pass
 
-        # ✅ Stop listeners
+        # Stop listeners
         for listener in getattr(self, "device_listeners", []):
             try:
                 listener.stop()
@@ -2018,17 +2064,18 @@ class FullTestScreen(QMainWindow):
             except Exception:
                 pass
 
-        # ✅ Stop PSU Automation Thread
+        # Stop PSU automation thread
         if self.psu_thread and self.psu_thread.isRunning():
             try:
-                self.psu_thread.terminate()   # HARD stop (not recommended generally but works for your case)
+                self.psu_thread.terminate()
                 self.psu_thread.wait(2000)
             except Exception:
                 pass
 
-        # ✅ Reset UI state
+        # Reset UI state
         self.unlock_configuration()
         self.lock_btn.setEnabled(True)
+
         self.log_signal.emit("✗ Test aborted by user", True)
 
 

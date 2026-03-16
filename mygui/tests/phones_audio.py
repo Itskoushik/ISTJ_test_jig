@@ -4,8 +4,8 @@ import time
 from PyQt5.QtWidgets import (
     QApplication
 )
-
-
+from devices.apx_analyzer import generator_control,read_apx_meter
+from core.excel_logger import write_excel
 
 
 def run(screen):
@@ -16,33 +16,32 @@ def run(screen):
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_j14_off():
-        screen.log_signal.emit("J14 successfully disconnected", False)
+        screen.log_signal.emit("HOT MIC Connector J14 successfully disconnected", False)
         time.sleep(0.5)
         
     else:
-        screen.log_signal.emit("ERROR: Failed to disconnect J14", True)
+        screen.log_signal.emit("ERROR: Failed to disconnect HOT MIC Connector J14", True)
         return
 
     QApplication.processEvents()
     time.sleep(2)
     
-    screen.log_signal.emit("Step 2: disconnecting PHONES Connector (J15)", False)
+    screen.log_signal.emit("Step 2: disconnecting NORMS PHONES Connector (J15)", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_j15_off():
-        screen.log_signal.emit("J15 successfully disconnected", False)
+        screen.log_signal.emit("NORMS PHONES Connector J15 successfully disconnected", False)
         time.sleep(0.5)
         
     else:
-        screen.log_signal.emit("ERROR: Failed to disconnect J15", True)
+        screen.log_signal.emit("ERROR: Failed to disconnect NORMS PHONES Connector J15", True)
         return
 
     QApplication.processEvents()
     time.sleep(2)
     
-    #disable audio analyser input.
-    
-    screen.log_signal.emit("Step 3: connecting Connector (J29)", False)
+     
+    screen.log_signal.emit("Step 3: connecting Audio analyser input to STATION BOX PH Connector (J29)", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_j29_on():
@@ -50,27 +49,27 @@ def run(screen):
         time.sleep(0.5)
         
     else:
-        screen.log_signal.emit("ERROR: Failed to connect J29", True)
+        screen.log_signal.emit("ERROR: Failed to connect Audio analyser input to STATION BOX PH Connector J29", True)
         return
 
     QApplication.processEvents()
     time.sleep(2)
     
-    screen.log_signal.emit("Step 4: connecting JACKS (J15) and (J13)", False)
+    screen.log_signal.emit("Step 4: connecting NORMS PHONES Connector (J15) and CONTROLLED MIC Connector (J13)", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_j15_on():
-        screen.log_signal.emit("J15 successfully connected", False)
+        screen.log_signal.emit("NORMS PHONES Connector J15 successfully connected", False)
         time.sleep(0.5)
         if STM32RelayController.set_j13_on():
-            screen.log_signal.emit("J13 successfully connected", False)
+            screen.log_signal.emit("CONTROLLED MIC Connector J13 successfully connected", False)
             time.sleep(0.5)
         else:
-            screen.log_signal.emit("ERROR: Failed to connect J13", True)
+            screen.log_signal.emit("ERROR: Failed to connect CONTROLLED MIC Connector J13", True)
             return
         
     else:
-        screen.log_signal.emit("ERROR: Failed to connect J15 or J13", True)
+        screen.log_signal.emit("ERROR: Failed to connect NORMS PHONES Connector J15", True)
         return
 
     QApplication.processEvents()
@@ -89,23 +88,48 @@ def run(screen):
     
     time.sleep(2)
     
-    #audio analyser tests
+    data = read_apx_meter(screen,min_v="10.5", max_v="11.5",max_thd=10)
+    if data:
+        # write_excel("E25", data["observation"])   # measured value
+        write_excel("E25", data["value"])         # raw vrms
+        write_excel("F25", data["result"])        # PASS / FAIL
+        
+    time.sleep(2)
+    generator_control(screen, level="750.0 uVrms", frequency=200,state="on")  # Ensure generator is OFF after test
+    time.sleep(0.9)
+    data = read_apx_meter(screen, min_v="7.7",max_thd=10)
+    if data:
+        # write_excel("E26", data["observation"])   # measured value
+        write_excel("E26", data["value"])         # raw vrms
+        write_excel("F26", data["result"])        # PASS / FAIL
+        
+    time.sleep(2)
+    generator_control(screen, level="750.0 uVrms", frequency=3500)  
+    data = read_apx_meter(screen, min_v="7.7",max_thd=10)
+    if data:
+        # write_excel("E26", data["observation"])   # measured value
+        write_excel("E27", data["value"])         # raw vrms
+        write_excel("F27", data["result"])        # PASS / FAIL
+        
+    time.sleep(2)
+    generator_control(screen, level="750.0 uVrms", frequency=1000)
     
-    screen.log_signal.emit("Step 5: disconnecting Connector (J15) and connecting Connector (J16)", False)
+    
+    screen.log_signal.emit("Step 5: disconnecting NORMS PHONES Connector (J15) and connecting STBY PHONES Connector (J16)", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_j15_off():
-        screen.log_signal.emit("J15 successfully disconnected", False)
+        screen.log_signal.emit("NORMS PHONES Connector J15 successfully disconnected", False)
         time.sleep(0.5)
         if STM32RelayController.set_j16_on():
-            screen.log_signal.emit("J16 successfully connected", False)
+            screen.log_signal.emit("STBY PHONES Connector J16 successfully connected", False)
             time.sleep(0.5)
         else:
-            screen.log_signal.emit("ERROR: Failed to connect J16", True)
+            screen.log_signal.emit("ERROR: Failed to connect STBY PHONES Connector J16", True)
             return
         
     else:
-        screen.log_signal.emit("ERROR: Failed to disconnect J15 or J16", True)
+        screen.log_signal.emit("ERROR: Failed to disconnect NORMS PHONES Connector J15 or STBY PHONES Connector J16", True)
         return
 
     QApplication.processEvents()
@@ -139,7 +163,31 @@ def run(screen):
     QApplication.processEvents()
     time.sleep(2)
     
-    #audio analyser tests
+    data = read_apx_meter(screen,min_v="10.5", max_v="11.5",max_thd=10)
+    if data:
+        # write_excel("E25", data["observation"])   # measured value
+        write_excel("E28", data["value"])         # raw vrms
+        write_excel("F28", data["result"])        # PASS / FAIL
+        
+    time.sleep(2)
+    generator_control(screen, level="750.0 uVrms", frequency=200,state="on")  # Ensure generator is OFF after test
+    time.sleep(0.9)
+    data = read_apx_meter(screen, min_v="7.7",max_thd=10)
+    if data:
+        # write_excel("E26", data["observation"])   # measured value
+        write_excel("E29", data["value"])         # raw vrms
+        write_excel("F29", data["result"])        # PASS / FAIL
+        
+    time.sleep(2)
+    generator_control(screen, level="750.0 uVrms", frequency=3500)  
+    data = read_apx_meter(screen, min_v="7.7",max_thd=10)
+    if data:
+        # write_excel("E26", data["observation"])   # measured value
+        write_excel("E30", data["value"])         # raw vrms
+        write_excel("F30", data["result"])        # PASS / FAIL
+        
+    time.sleep(2)
+    generator_control(screen, level="750.0 uVrms", frequency=1000)
     
     screen.log_signal.emit("✓ PHONES AUDIO TEST COMPLETED", False)
     time.sleep(0.5)

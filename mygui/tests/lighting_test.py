@@ -76,7 +76,7 @@ def alh1_norm(screen):
     screen.log_signal.emit("Step 5: Verified backlighting of faceplate legends, knobs, and pushbuttons", False)
     screen.log_signal.emit("Step 6: Decreasing right power supply voltage to 5 Vdc ", False)
     # ▶ CHANNEL 2 SEQUENCE – STEP 2
-    # screen.worker_ch2_5v()
+    screen.worker_ch2_5v()
     time.sleep(1)
     
     # 🛑 PAUSE POINT
@@ -100,7 +100,7 @@ def alh1_norm(screen):
     screen.log_signal.emit("Step 7: ON, TX and V/UHF1 TX SEL indicators illuminated brightly", False)
     screen.log_signal.emit("Step 8: Decreasing right power supply voltage to 12 Vdc ", False)
     # ▶ CHANNEL 2 SEQUENCE – STEP 2
-    # screen.worker_ch2_12v()
+    screen.worker_ch2_12v()
     time.sleep(1)
     
     # 🛑 PAUSE POINT
@@ -112,6 +112,13 @@ def alh1_norm(screen):
     )
     # ⏸ WAIT until operator clicks OK
     screen.operator_event.wait()
+    result = getattr(screen, "last_test_result", "")
+    operator = getattr(screen, "last_operator_response", "")
+    print("Operator:", operator)   # YES / NO
+    print("Result:", result)       # PASS / FAIL
+
+    write_excel("E103",operator)   # YES
+    write_excel("F103",result)     # PASS 
     screen.log_signal.emit("Step 9: ON, TX and V/UHF1 TX SEL indicators illuminated dimly", False)
     time.sleep(2)
     
@@ -201,7 +208,7 @@ def alh3_norm(screen):
     screen.log_signal.emit("Step 5: Verified backlighting of faceplate legends, knobs, and pushbuttons", False)
     screen.log_signal.emit("Step 6: Decreasing right power supply voltage to 5 Vdc ", False)
     # ▶ CHANNEL 2 SEQUENCE – STEP 2
-    # screen.worker_ch2_5v()
+    screen.worker_ch2_5v()
     time.sleep(1)
     
     # 🛑 PAUSE POINT
@@ -225,7 +232,7 @@ def alh3_norm(screen):
     screen.log_signal.emit("Step 7: ON, TX and V/UHF1 TX SEL indicators illuminated brightly", False)
     screen.log_signal.emit("Step 8: Decreasing right power supply voltage to 12 Vdc ", False)
     # ▶ CHANNEL 2 SEQUENCE – STEP 2
-    # screen.worker_ch2_12v()
+    screen.worker_ch2_12v()
     time.sleep(1)
     
     # 🛑 PAUSE POINT
@@ -237,6 +244,13 @@ def alh3_norm(screen):
     )
     # ⏸ WAIT until operator clicks OK
     screen.operator_event.wait()
+    result = getattr(screen, "last_test_result", "")
+    operator = getattr(screen, "last_operator_response", "")
+    print("Operator:", operator)   # YES / NO
+    print("Result:", result)       # PASS / FAIL
+
+    write_excel("E103",operator)   # YES
+    write_excel("F103",result)     # PASS 
     screen.log_signal.emit("Step 9: ON, TX and V/UHF1 TX SEL indicators illuminated dimly", False)
     time.sleep(2)
     
@@ -329,7 +343,7 @@ def alh2_norm(screen):
     screen.log_signal.emit("Step 5: Verified backlighting of faceplate legends, knobs, and pushbuttons", False)
     screen.log_signal.emit("Step 6: Decreasing right power supply voltage to 5 Vdc ", False)
     # ▶ CHANNEL 2 SEQUENCE – STEP 2
-    # screen.worker_ch2_5v()
+    screen.worker_ch2_5v()
     time.sleep(1)
     
     # 🛑 PAUSE POINT
@@ -353,7 +367,7 @@ def alh2_norm(screen):
     screen.log_signal.emit("Step 7: ON, TX and V/UHF1 TX SEL indicators illuminated brightly", False)
     screen.log_signal.emit("Step 8: Decreasing right power supply voltage to 12 Vdc ", False)
     # ▶ CHANNEL 2 SEQUENCE – STEP 2
-    # screen.worker_ch2_12v()
+    screen.worker_ch2_12v()
     time.sleep(1)
     
     # 🛑 PAUSE POINT
@@ -365,6 +379,13 @@ def alh2_norm(screen):
     )
     # ⏸ WAIT until operator clicks OK
     screen.operator_event.wait()
+    result = getattr(screen, "last_test_result", "")
+    operator = getattr(screen, "last_operator_response", "")
+    print("Operator:", operator)   # YES / NO
+    print("Result:", result)       # PASS / FAIL
+
+    write_excel("E103",operator)   # YES
+    write_excel("F103",result)     # PASS 
     screen.log_signal.emit("Step 9: ON, TX and V/UHF1 TX SEL indicators illuminated dimly", False)
     time.sleep(2)
     
@@ -412,7 +433,7 @@ def run_stby(screen):
     screen.log_signal.emit("Step 2: Verified backlighting of faceplate legends, knobs, and pushbuttons", False)
     screen.log_signal.emit("Step 3: Decreasing right power supply voltage to 5 Vdc ", False)
     # ▶ CHANNEL 2 SEQUENCE – STEP 2
-    # screen.worker_ch2_5v()
+    screen.worker_ch2_5v()
     time.sleep(1)
     
     # 🛑 PAUSE POINT
@@ -436,7 +457,7 @@ def run_stby(screen):
     screen.log_signal.emit("Step 4: ON, TX and V/UHF1 TX SEL indicators illuminated brightly", False)
     screen.log_signal.emit("Step 5: Decreasing right power supply voltage to 12 Vdc ", False)
     # ▶ CHANNEL 2 SEQUENCE – STEP 2
-    # screen.worker_ch2_12v()
+    screen.worker_ch2_12v()
     time.sleep(1)
     
     # 🛑 PAUSE POINT
@@ -448,6 +469,13 @@ def run_stby(screen):
     )
     # ⏸ WAIT until operator clicks OK
     screen.operator_event.wait()
+    result = getattr(screen, "last_test_result", "")
+    operator = getattr(screen, "last_operator_response", "")
+    print("Operator:", operator)   # YES / NO
+    print("Result:", result)       # PASS / FAIL
+
+    write_excel("E104",operator)   # YES
+    write_excel("F104",result)     # PASS 
     screen.log_signal.emit("Step 6: ON, TX and V/UHF1 TX SEL indicators illuminated dimly", False)
     time.sleep(2)
     

@@ -29,7 +29,7 @@ class LoginScreen(QMainWindow):
         self.init_employee_db()
         self.employee_cache = {}   # name → emp_id cache
         self.setWindowTitle("HAL - Login")
-        self.setWindowIcon(QIcon(str(RESOURCES_DIR / "wave.png")))
+        self.setWindowIcon(QIcon(str(RESOURCES_DIR / "istj.png")))
         self.setGeometry(100, 100, 550, 650)
         self.setFixedSize(550, 600)  # Fixed window size, non-resizable
         self.setStyleSheet("background: linear-gradient(to bottom, #e0f7fa, #ffffff);")

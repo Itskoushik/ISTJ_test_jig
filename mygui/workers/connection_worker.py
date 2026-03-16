@@ -2,8 +2,9 @@ from PyQt5.QtCore import QThread, pyqtSignal
 import time
 from devices.power_supply import discover_power_supply
 from devices.microcontroller import discover_microcontroller
-
+from devices.apx_analyzer import connect_apx
 from devices.visa_auto_detector import scan_all_instruments
+from devices.oscilloscope import OscilloscopeConnection
 
 class ConnectionWorker(QThread):
     """
@@ -22,6 +23,7 @@ class ConnectionWorker(QThread):
         self.claimed_visa_resources = set()
         self.dmm_connection = None
         self.device_status = {}
+        self.scope_manager = OscilloscopeConnection()
 
 
         self.device_status = {
@@ -38,8 +40,6 @@ class ConnectionWorker(QThread):
         Real VISA discovery for oscilloscope, placeholders for other devices.
         """
         time.sleep(0.5)
-        
-        # ===== POWER SUPPLY (REAL VISA DISCOVERY) =====
         
         
         # ===== POWER SUPPLY (REAL VISA DISCOVERY) =====
@@ -73,24 +73,46 @@ class ConnectionWorker(QThread):
             self.log_signal.emit("No DMM detected", True)
             self.device_status["DMM (Digital Multimeter)"] = False
             
-        # TEMP: set True if scope not physically connected
-        FORCE_SCOPE_PRESENT = True
+        
 
         # ===== OSCILLOSCOPE =====
-        if devices["oscilloscope"]:
-            self.oscilloscope_connection = devices["oscilloscope"]
-            self.oscilloscope_found = True
-            self.device_status["Oscilloscope"] = True
+        self.log_signal.emit("Searching for Oscilloscope...", False)
 
-        elif FORCE_SCOPE_PRESENT:
-            self.log_signal.emit("Oscilloscope not detected — bypassing for testing..", True)
-            self.oscilloscope_found = True
-            self.device_status["Oscilloscope"] = True
+        try:
 
-        else:
-            self.log_signal.emit("No oscilloscope detected", True)
-            self.oscilloscope_found = False
+            # pass claimed resources so scope doesn't steal PSU/DMM
+            self.scope_manager.claimed_visa_resources = self.claimed_visa_resources
+
+            found = self.scope_manager.discover_and_connect()
+
+            if found:
+
+                self.oscilloscope_connection = self.scope_manager.instrument
+                self.oscilloscope_found = True
+                self.device_status["Oscilloscope"] = True
+
+                ident = self.scope_manager.get_identification()
+
+                if ident:
+                    self.log_signal.emit(
+                        f"Oscilloscope detected: {ident.manufacturer} {ident.model} ✓",
+                        False
+                    )
+
+                # mark VISA resource as used
+                if self.scope_manager.resource_string:
+                    self.claimed_visa_resources.add(self.scope_manager.resource_string)
+
+            else:
+                self.log_signal.emit("No oscilloscope detected", True)
+                self.device_status["Oscilloscope"] = False
+                self.oscilloscope_found = False
+
+        except Exception as e:
+
+            self.log_signal.emit(f"Oscilloscope detection error: {e}", True)
             self.device_status["Oscilloscope"] = False
+            self.oscilloscope_found = False
 
 
 
@@ -98,11 +120,20 @@ class ConnectionWorker(QThread):
 
 
         
-        # ===== APX 525 =====
-        self.log_signal.emit("Searching for APX 525…", False)
-        time.sleep(1.5)
-        self.log_signal.emit("APX 525 found at 192.168.1.13 ✓", False)
-        self.device_status["Audio Analyzer"] = True
+        # ===== AUDIO ANALYZER (APX525) =====
+        self.log_signal.emit("Searching for Audio Analyzer (APx525)...", False)
+
+        found, connection = connect_apx(
+            lambda msg, err: self.log_signal.emit(msg, err)
+        )
+
+        if found:
+            self.apx_connection = connection
+            self.device_status["Audio Analyzer"] = True
+            self.log_signal.emit("Audio Analyzer connected ✓", False)
+        else:
+            self.device_status["Audio Analyzer"] = False
+            self.log_signal.emit("Audio Analyzer not detected", True)
 
         
         # ===== MICROCONTROLLER =====

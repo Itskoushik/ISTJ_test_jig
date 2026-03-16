@@ -331,7 +331,7 @@ def alh2(screen):
     screen.show_popup_signal.emit(
         "⚠ Operator Action Required",
         "• Press and Release  O/R and SONIC switches.\n"
-        "• ON and ISO indicators should not Extinguish\n",
+        "• ON and ISO indicators should Extinguish\n",
         RESOURCES_DIR / "or_sonic.jpeg","yes_no",None
     )
     # ⏸ WAIT until operator clicks OK

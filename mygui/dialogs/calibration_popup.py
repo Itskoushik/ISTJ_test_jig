@@ -36,7 +36,7 @@ class CalibrationPopup(QDialog):
 
         # Instructions
         instructions = QLabel(
-            "• Connect cables J65 and J66.\n"
+            "• Connect cables J65 to J101 and J66 to J102.\n"
             "• Turn the ICS knobs fully CW.\n"
             "• Set MIC Mode to HOT.\n"
             "• Turn TX SEL knobs fully CCW and to the OUT position.\n"

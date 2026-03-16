@@ -2000,7 +2000,7 @@ def run_norm(screen):
 
     QApplication.processEvents()
     time.sleep(2)
-    result=read_voltage(screen," COM 1 VOL(J37)","10V","12V")
+    result=read_voltage(screen," NAV4 VOL(J47)","10V","12V")
     if result:
         write_excel("M62", result["observation"])   # 11.95 V
         write_excel("P62", result["result"])        # PASS

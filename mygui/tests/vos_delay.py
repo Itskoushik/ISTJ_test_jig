@@ -5,21 +5,24 @@ from PyQt5.QtWidgets import (
     QApplication
 )
 from core.excel_logger import write_excel
+from devices.apx_analyzer import generator_control,read_apx_meter,audible_tone_check,audible_monitor_check
 
 def run_stby(screen):
     screen.log_signal.emit("==========COMMENCING VOS DELAY TEST==========", False)
             
     #audio analyser output set to 750uvrms at 1khz
-    
+    generator_control(screen, level="750.0 uVrms", frequency=1000)
+    time.sleep(2)
+    # 🛑 PAUSE POINT
     screen.log_signal.emit("Step 1: Disconnecting NORM PHONES Connector (J15)  ", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_j15_off():
-        screen.log_signal.emit("J15 successfully Disconnected", False)
+        screen.log_signal.emit("NORM PHONES Connector J15 successfully Disconnected", False)
         time.sleep(0.5)
         
     else:
-        screen.log_signal.emit("ERROR: Failed to Disconnect J15.", True)
+        screen.log_signal.emit("ERROR: Failed to Disconnect NORM PHONES Connector J15.", True)
         return
 
     QApplication.processEvents()
@@ -29,51 +32,21 @@ def run_stby(screen):
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_j16_on():
-        screen.log_signal.emit("J16 successfully Connected", False)
+        screen.log_signal.emit("STBY PHONES Connector J16 successfully Connected", False)
         time.sleep(0.5)
         
     else:
-        screen.log_signal.emit("ERROR: Failed to Connect J16.", True)
+        screen.log_signal.emit("ERROR: Failed to Connect STBY PHONES Connector J16.", True)
         return
 
     QApplication.processEvents()
     time.sleep(0.5)
     
     time.sleep(2)
-    # 🛑 PAUSE POINT
-    screen.log_signal.emit("Step 3: Increasing audio analyser MONITOR volume until audible.", False)
-    
-    screen.operator_event.clear()
-    screen.show_popup_signal.emit(
-        "⚠ IS THE TONE AUDIBLE?",
-        "• Increasing audio analyser MONITOR volume until audible.\n",
-        RESOURCES_DIR / "hear.png",
-        "yes_no",
-        10
-    )
-
-    # ⏸ WAIT until operator clicks OK
-    screen.operator_event.wait()
-    
-    time.sleep(2)
-    
-    screen.log_signal.emit(
-        "OPERATOR ACTION: Turn the MIC MODE knob fully clockwise (CW).",
-        False
-    )
-    
-    # 🛑 PAUSE POINT
-    screen.operator_event.clear()
-    screen.show_popup_signal.emit(
-        "⚠ Operator Action Required",
-        "• Turn the MIC MODE knob fully CLOCKWISE (CW)\n"
-        "• Ensure microphone is connected properly\n",
-        RESOURCES_DIR / "knob_fcw.png","ok",None
-    )
-    # ⏸ WAIT until operator clicks OK
-    screen.operator_event.wait()
-    
-    time.sleep(2)
+    audible_tone_check(screen)
+    time.sleep(1)
+    audible_monitor_check(screen)
+    time.sleep(1)
     # 🛑 PAUSE POINT
     
     screen.operator_event.clear()
@@ -122,41 +95,13 @@ def run_norm(screen):
     screen.log_signal.emit("==========COMMENCING VOS DELAY TEST==========", False)
             
     #audio analyser output set to 750uvrms at 1khz
-    
+    generator_control(screen, level="750.0 uVrms", frequency=1000)
     time.sleep(2)
-    # 🛑 PAUSE POINT
-    screen.log_signal.emit("Step 1: Increasing audio analyser MONITOR volume until audible.", False)
-    
-    screen.operator_event.clear()
-    screen.show_popup_signal.emit(
-        "⚠ IS THE TONE AUDIBLE?",
-        "• Increasing audio analyser MONITOR volume until audible.\n",
-        RESOURCES_DIR / "hear.png",
-        "yes_no",
-        10
-    )
 
-    # ⏸ WAIT until operator clicks OK
-    screen.operator_event.wait()
-    
-    time.sleep(2)
-    
-    screen.log_signal.emit(
-        "OPERATOR ACTION: Turn the MIC MODE knob fully clockwise (CW).",
-        False
-    )
-    
-    # 🛑 PAUSE POINT
-    screen.operator_event.clear()
-    screen.show_popup_signal.emit(
-        "⚠ Operator Action Required",
-        "• Turn the MIC MODE knob fully CLOCKWISE (CW)\n",
-        RESOURCES_DIR / "knob_fcw.png","ok",None
-    )
-    # ⏸ WAIT until operator clicks OK
-    screen.operator_event.wait()
-    
-    time.sleep(2)
+    audible_tone_check(screen)
+    time.sleep(1)
+    audible_monitor_check(screen)
+    time.sleep(1)
     # 🛑 PAUSE POINT
     
     screen.operator_event.clear()

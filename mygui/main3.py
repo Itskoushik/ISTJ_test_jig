@@ -57,7 +57,7 @@ class HALApplication(QApplication):
             self.main_window = QMainWindow()
             self.main_window.setGeometry(100, 100, 550, 550)
             self.main_window.setWindowTitle("HAL")
-            self.main_window.setWindowIcon(QIcon(str(RESOURCES_DIR / "wave.png")))
+            self.main_window.setWindowIcon(QIcon(str(RESOURCES_DIR / "istj.png")))
             self.main_window.setFixedSize(550, 550)
             self.main_window.setStyleSheet("background: linear-gradient(to bottom, #e0f7fa, #ffffff);")
         

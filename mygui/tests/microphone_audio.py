@@ -5,18 +5,16 @@ from PyQt5.QtWidgets import (
     QApplication
 )
 from core.excel_logger import write_excel
+from devices.apx_analyzer import read_apx_meter,generator_control,audible_tone_check,audible_reduce_until_silent,audible_increase_until_audible,reduce_monitor_gain_to_x1
 def run_stby(screen):
     screen.log_signal.emit("==========COMMENCING MICROPHONE AUDIO TEST==========", False)
-
-    screen.log_signal.emit(
-        "OPERATOR ACTION: Turn the MIC MODE knob fully clockwise (CW).",
-        False
-    )
-
-    screen.log_signal.emit(
-        "AUDIO ANALYSER NOTE: MIC MODE set to maximum (Fully CW) before test start.",
-        False
-    )
+    
+    data = read_apx_meter(screen,min_v="1.8", max_v="2.2")
+    if data:
+        # write_excel("E11", data["observation"])   # measured value
+        write_excel("E11", data["value"])         # raw vrms
+        write_excel("F11", data["result"])        # PASS / FAIL
+        
     # 🛑 PAUSE POINT
     screen.operator_event.clear()
     screen.show_popup_signal.emit(
@@ -26,6 +24,11 @@ def run_stby(screen):
     )
     # ⏸ WAIT until operator clicks OK
     screen.operator_event.wait()
+    data = read_apx_meter(screen, max_v="2", unit="mvrms")
+    if data:
+        # write_excel("E13", data["observation"])   # measured value
+        write_excel("E13", data["value"])         # raw vrms
+        write_excel("F13", data["result"])        # PASS / FAIL
     screen.log_signal.emit("Step 1: Turning ICS(S32) to ON.  ", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
@@ -35,11 +38,15 @@ def run_stby(screen):
         
     else:
         screen.log_signal.emit("ERROR: Failed to  S32 to ON", True)
-        return
+        
 
     QApplication.processEvents()
     time.sleep(0.5)
-    
+    data = read_apx_meter(screen,min_v="1.8", max_v="2.2")
+    if data:
+        # write_excel("E15", data["observation"])   # measured value
+        write_excel("E15", data["value"])         # raw vrms
+        write_excel("F15", data["result"])        # PASS / FAIL
     
     screen.log_signal.emit("Step 2: Turning ICS(S32) to OFF.  ", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
@@ -50,13 +57,29 @@ def run_stby(screen):
         
     else:
         screen.log_signal.emit("ERROR: Failed to  S32 to OFF", True)
-        return
+        
 
     QApplication.processEvents()
     time.sleep(0.5)
     
+    screen.log_signal.emit("Step 3: Turning TX SWITCH (S30) to ON.  ", False)
+    QApplication.processEvents()   # 🔑 FORCE UI UPDATE
+
+    if STM32RelayController.set_s30_on():
+        screen.log_signal.emit("TX SWITCH (S30) successfully set to ON", False)
+        time.sleep(0.5)
+        
+    else:
+        screen.log_signal.emit("ERROR: Failed to  S30 to ON", True)
+        
     
-    screen.log_signal.emit("Step 3: Turning TX SWITCH (S30) to OFF.  ", False)
+    data = read_apx_meter(screen,min_v="1.8", max_v="2.2")
+    if data:
+        # write_excel("E17", data["observation"])   # measured value
+        write_excel("E17", data["value"])         # raw vrms
+        write_excel("F17", data["result"])        # PASS / FAIL
+        
+    screen.log_signal.emit("Step 4: Turning TX SWITCH (S30) to OFF.  ", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_s30_off():
@@ -65,12 +88,12 @@ def run_stby(screen):
         
     else:
         screen.log_signal.emit("ERROR: Failed to  S30 to OFF", True)
-        return
+        
 
     QApplication.processEvents()
     time.sleep(0.5)
-    
-    screen.log_signal.emit("Step 4: Turning LOAD Switch (S31) to NEUTRAL.  ", False)
+    generator_control(screen,state="off")
+    screen.log_signal.emit("Step 5: Turning LOAD Switch (S31) to NEUTRAL.  ", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_s31_neutral():
@@ -79,7 +102,7 @@ def run_stby(screen):
         
     else:
         screen.log_signal.emit("ERROR: Failed to  S31 to NEUTRAL", True)
-        return
+        
 
     QApplication.processEvents()
     time.sleep(0.5)
@@ -123,7 +146,7 @@ def run_stby(screen):
     write_excel("F19",result)     # PASS
     
     
-    screen.log_signal.emit("Step 5: Disconnecting J28 Headset jack.", False)
+    screen.log_signal.emit("Step 6: Disconnecting J28 Headset jack.", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
     
     # 🛑 PAUSE POINT
@@ -140,7 +163,7 @@ def run_stby(screen):
     time.sleep(2)
 
     
-    screen.log_signal.emit("Step 6: Turning LOAD Switch (S31) to 600 ohms.  ", False)
+    screen.log_signal.emit("Step 7: Turning LOAD Switch (S31) to 600 ohms.  ", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_s31_600ohm():
@@ -149,29 +172,22 @@ def run_stby(screen):
         
     else:
         screen.log_signal.emit("ERROR: Failed to  S31 to 600 ohms", True)
-        return
+        
 
     QApplication.processEvents()
     time.sleep(0.5)
-    
+    generator_control(screen,state="on")
     
     time.sleep(2)
     # 🛑 PAUSE POINT
-    screen.log_signal.emit("Step 7: Increasing audio analyser MONITOR volume until tone is audible.", False)
-    
-    screen.operator_event.clear()
-    screen.show_popup_signal.emit(
-        "⚠ IS THE TONE AUDIBLE?",
-        "• Increasing audio analyser MONITOR volume until tone is audible.\n",
-        RESOURCES_DIR / "hear.png",
-        "yes_no",
-        10
-    )
+    screen.log_signal.emit("Step 8: Increasing audio analyser MONITOR volume until tone is audible.", False)
+    time.sleep(2)
+    data = audible_tone_check(screen)
 
-    # ⏸ WAIT until operator clicks OK
-    screen.operator_event.wait()
-    
-    time.sleep(5)
+    operator = data["operator"]
+    result = data["result"]
+    gain_used=data["gain"]
+
     
     # 🛑 PAUSE POINT
     screen.operator_event.clear()
@@ -187,41 +203,26 @@ def run_stby(screen):
     screen.operator_event.wait()
     
     time.sleep(5)
-    screen.log_signal.emit("Step 8: Decreasing audio analyser Generator Output until tone is not audible.", False)
+    screen.log_signal.emit("Step 9: Decreasing audio analyser Generator Output until tone is not audible.", False)
     
-    # 🛑 PAUSE POINT
-    screen.operator_event.clear()
-    screen.show_popup_signal.emit(
-        "⚠ IS THE TONE NOT AUDIBLE?",
-        "• Decreasing audio analyser Generator Output until tone is not audible.\n",
-        RESOURCES_DIR / "hear.png",
-        "yes_no",
-        10
-    )
+    audible_reduce_until_silent(screen)
+    time.sleep(2)
 
-    # ⏸ WAIT until operator clicks OK
-    screen.operator_event.wait()
-    
-    time.sleep(5)
-    screen.log_signal.emit("Step 9: Increasing audio analyser Generator Output until tone is audible.", False)
-    # 🛑 PAUSE POINT
-    screen.operator_event.clear()
-    screen.show_popup_signal.emit(
-        "⚠ IS THE TONE AUDIBLE?",
-        "• Increasing audio analyser Generator Output until tone is audible.\n",
-        RESOURCES_DIR / "hear.png",
-        "yes_no",
-        10
-    )
+    audible_increase_until_audible(screen)
+    data=read_apx_meter(screen,min_v="100", max_v="500", unit="uVrms")
+    if data:
+        write_excel("E21", data["value"])         # raw vrms at audible threshold
+        write_excel("F21", data["result"])        # PASS / FAIL
+    time.sleep(2)
+    screen.log_signal.emit("Step 10: Increasing audio analyser Generator Output until tone is audible.", False)
 
-    # ⏸ WAIT until operator clicks OK
-    screen.operator_event.wait()
-    time.sleep(0.5)
-    screen.log_signal.emit("Step 10: decreasing audio analyser Monitor volume.", False)
+    screen.log_signal.emit("Step 11: decreasing audio analyser Monitor volume.", False)
 
     time.sleep(2)
+    reduce_monitor_gain_to_x1(screen, gain_used)
+    time.sleep(1)
     
-    screen.log_signal.emit("Step 11: Disconnecting MIC Connector (J13)", False)
+    screen.log_signal.emit("Step 12: Disconnecting MIC Connector (J13)", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_j13_off():
@@ -230,14 +231,14 @@ def run_stby(screen):
         
     else:
         screen.log_signal.emit("ERROR: Failed to disconnect J13", True)
-        return
+        
 
     QApplication.processEvents()
     time.sleep(0.5)
     
     time.sleep(2)
     
-    screen.log_signal.emit("Step 12: Connecting HOT MIC Connector (J14)", False)
+    screen.log_signal.emit("Step 13: Connecting HOT MIC Connector (J14)", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_j14_on():
@@ -246,11 +247,16 @@ def run_stby(screen):
         
     else:
         screen.log_signal.emit("ERROR: Failed to connect J14", True)
-        return
+        
 
     QApplication.processEvents()
     time.sleep(2)
-    
+    generator_control(screen,level="750.0 uVrms",state="on")
+    time.sleep(1)
+    data=read_apx_meter(screen,min_v="1.8", max_v="2.2")
+    if data:
+        write_excel("E23", data["value"])         # raw vrms at 750 uVrms gen level
+        write_excel("F23", data["result"])        # PASS / FAIL
     # 🛑 PAUSE POINT
     screen.operator_event.clear()
     screen.show_popup_signal.emit(
@@ -270,16 +276,12 @@ def run_stby(screen):
 def run_norm(screen):
     
     screen.log_signal.emit("==========COMMENCING MICROPHONE AUDIO TEST==========", False)
-
-    screen.log_signal.emit(
-        "OPERATOR ACTION: Turn the MIC MODE knob fully clockwise (CW).",
-        False
-    )
-
-    screen.log_signal.emit(
-        "AUDIO ANALYSER NOTE: MIC MODE set to maximum (Fully CW) before test start.",
-        False
-    )
+    data = read_apx_meter(screen,min_v="1.8", max_v="2.2")
+    if data:
+        # write_excel("E10", data["observation"])   # measured value
+        write_excel("E10", data["value"])         # raw vrms
+        write_excel("F10", data["result"])        # PASS / FAIL 
+    time.sleep(1)
     # 🛑 PAUSE POINT
     screen.operator_event.clear()
     screen.show_popup_signal.emit(
@@ -289,6 +291,13 @@ def run_norm(screen):
     )
     # ⏸ WAIT until operator clicks OK
     screen.operator_event.wait()
+    time.sleep(1)
+    data = read_apx_meter(screen, max_v="2", unit="mvrms")
+    if data:
+        # write_excel("E12", data["observation"])   # measured value
+        write_excel("E12", data["value"])         # raw vrms
+        write_excel("F12", data["result"])        # PASS / FAIL
+    time.sleep(1)
     screen.log_signal.emit("Step 1: Turning ICS(S32) to ON.  ", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
@@ -298,12 +307,17 @@ def run_norm(screen):
         
     else:
         screen.log_signal.emit("ERROR: Failed to  S32 to ON", True)
-        return
+        
 
     QApplication.processEvents()
     time.sleep(0.5)
+    data = read_apx_meter(screen,min_v="1.8", max_v="2.2")
+    if data:
+        # write_excel("E14", data["observation"])   # measured value
+        write_excel("E14", data["value"])         # raw vrms
+        write_excel("F14", data["result"])        # PASS / FAIL
     
-    
+    time.sleep(1)
     screen.log_signal.emit("Step 2: Turning ICS(S32) to OFF.  ", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
@@ -313,13 +327,29 @@ def run_norm(screen):
         
     else:
         screen.log_signal.emit("ERROR: Failed to  S32 to OFF", True)
-        return
+        
 
     QApplication.processEvents()
     time.sleep(0.5)
     
+    screen.log_signal.emit("Step 3: Turning TX SWITCH (S30) to ON.  ", False)
+    QApplication.processEvents()   # 🔑 FORCE UI UPDATE
+
+    if STM32RelayController.set_s30_on():
+        screen.log_signal.emit("TX SWITCH (S30) successfully set to ON", False)
+        time.sleep(0.5)
+        
+    else:
+        screen.log_signal.emit("ERROR: Failed to  S30 to ON", True)
+        
     
-    screen.log_signal.emit("Step 3: Turning TX SWITCH (S30) to OFF.  ", False)
+    data = read_apx_meter(screen,min_v="1.8", max_v="2.2")
+    if data:
+        # write_excel("E16", data["observation"])   # measured value
+        write_excel("E16", data["value"])         # raw vrms
+        write_excel("F16", data["result"])        # PASS / FAIL
+    
+    screen.log_signal.emit("Step 4: Turning TX SWITCH (S30) to OFF.  ", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_s30_off():
@@ -328,12 +358,14 @@ def run_norm(screen):
         
     else:
         screen.log_signal.emit("ERROR: Failed to  S30 to OFF", True)
-        return
+        
 
     QApplication.processEvents()
     time.sleep(0.5)
     
-    screen.log_signal.emit("Step 4: Turning LOAD Switch (S31) to NEUTRAL.  ", False)
+    generator_control(screen,state="off")
+    
+    screen.log_signal.emit("Step 5: Turning LOAD Switch (S31) to NEUTRAL.  ", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_s31_neutral():
@@ -342,7 +374,7 @@ def run_norm(screen):
         
     else:
         screen.log_signal.emit("ERROR: Failed to  S31 to NEUTRAL", True)
-        return
+        
 
     QApplication.processEvents()
     time.sleep(0.5)
@@ -384,8 +416,8 @@ def run_norm(screen):
     write_excel("E18",operator)   # YES
     write_excel("F18",result)     # PASS
     
-    
-    screen.log_signal.emit("Step 5: Disconnecting J28 Headset jack.", False)
+    time.sleep(1)
+    screen.log_signal.emit("Step 6: Disconnecting J28 Headset jack.", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
     
     # 🛑 PAUSE POINT
@@ -401,7 +433,7 @@ def run_norm(screen):
     screen.log_signal.emit("J28 successfully disconnected", False)
     time.sleep(2)
     
-    screen.log_signal.emit("Step 6: Turning LOAD Switch (S31) to 600 ohms.  ", False)
+    screen.log_signal.emit("Step 7: Turning LOAD Switch (S31) to 600 ohms.  ", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_s31_600ohm():
@@ -410,29 +442,26 @@ def run_norm(screen):
         
     else:
         screen.log_signal.emit("ERROR: Failed to  S31 to 600 ohms", True)
-        return
+        
 
     QApplication.processEvents()
     time.sleep(0.5)
-    
+    generator_control(screen,state="on")
     
     time.sleep(2)
     # 🛑 PAUSE POINT
-    screen.log_signal.emit("Step 7: Increasing audio analyser MONITOR volume until tone is audible.", False)
+    screen.log_signal.emit("Step 8: Increasing audio analyser MONITOR volume until tone is audible.", False)
     
-    screen.operator_event.clear()
-    screen.show_popup_signal.emit(
-        "⚠ IS THE TONE AUDIBLE?",
-        "• Increasing audio analyser MONITOR volume until tone is audible.\n",
-        RESOURCES_DIR / "hear.png",
-        "yes_no",
-        10
-    )
+    time.sleep(2)
 
-    # ⏸ WAIT until operator clicks OK
-    screen.operator_event.wait()
-    
-    time.sleep(5)
+    data = audible_tone_check(screen)
+
+    operator = data["operator"]
+    result = data["result"]
+    gain_used=data["gain"]
+
+    print("Operator:", operator)
+    print("Result:", result)
     
     # 🛑 PAUSE POINT
     screen.operator_event.clear()
@@ -447,42 +476,31 @@ def run_norm(screen):
     # ⏸ WAIT until operator clicks OK
     screen.operator_event.wait()
     
-    time.sleep(5)
-    screen.log_signal.emit("Step 8: Decreasing audio analyser Generator Output until tone is not audible.", False)
+    time.sleep(2)
+    screen.log_signal.emit("Step 9: Decreasing audio analyser Generator Output until tone is not audible.", False)
     
-    # 🛑 PAUSE POINT
-    screen.operator_event.clear()
-    screen.show_popup_signal.emit(
-        "⚠ IS THE TONE NOT AUDIBLE?",
-        "• Decreasing audio analyser Generator Output until tone is not audible.\n",
-        RESOURCES_DIR / "hear.png",
-        "yes_no",
-        10
-    )
-
-    # ⏸ WAIT until operator clicks OK
-    screen.operator_event.wait()
-    
-    time.sleep(5)
-    screen.log_signal.emit("Step 9: Increasing audio analyser Generator Output until audible.", False)
-    # 🛑 PAUSE POINT
-    screen.operator_event.clear()
-    screen.show_popup_signal.emit(
-        "⚠ IS THE TONE AUDIBLE?",
-        "• Increasing audio analyser Generator Output until tone is audible.\n",
-        RESOURCES_DIR / "hear.png",
-        "yes_no",
-        10
-    )
-
-    # ⏸ WAIT until operator clicks OK
-    screen.operator_event.wait()
-    time.sleep(0.5)
-    screen.log_signal.emit("Step 10: decreasing audio analyser Monitor volume.", False)
+    audible_reduce_until_silent(screen)
 
     time.sleep(2)
+
+    audible_increase_until_audible(screen)
     
-    screen.log_signal.emit("Step 11: Disconnecting MIC Connector (J13)", False)
+    time.sleep(2)
+    data=read_apx_meter(screen,min_v="100", max_v="500", unit="uVrms")
+    if data:
+        write_excel("E20", data["value"])         # raw vrms at audible threshold
+        write_excel("F20", data["result"])        # PASS / FAIL
+    time.sleep(2)
+    screen.log_signal.emit("Step 11: decreasing audio analyser Monitor volume.", False)
+
+    time.sleep(2)
+    reduce_monitor_gain_to_x1(screen, gain_used)
+    # ⏸ WAIT until operator clicks OK
+   
+    time.sleep(0.5)
+    
+    
+    screen.log_signal.emit("Step 12: Disconnecting MIC Connector (J13)", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_j13_off():
@@ -491,14 +509,14 @@ def run_norm(screen):
         
     else:
         screen.log_signal.emit("ERROR: Failed to disconnect J13", True)
-        return
+        
 
     QApplication.processEvents()
     time.sleep(0.5)
     
     time.sleep(2)
     
-    screen.log_signal.emit("Step 12: Connecting HOT MIC Connector (J14)", False)
+    screen.log_signal.emit("Step 13: Connecting HOT MIC Connector (J14)", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
 
     if STM32RelayController.set_j14_on():
@@ -507,11 +525,16 @@ def run_norm(screen):
         
     else:
         screen.log_signal.emit("ERROR: Failed to connect J14", True)
-        return
+        
 
     QApplication.processEvents()
     time.sleep(2)
-    
+    generator_control(screen,level="750.0 uVrms",state="on")
+    time.sleep(1)
+    data=read_apx_meter(screen,min_v="1.8", max_v="2.2")
+    if data:
+        write_excel("E22", data["value"])         # raw vrms at 750 uVrms gen level
+        write_excel("F22", data["result"])        # PASS / FAIL
     # 🛑 PAUSE POINT
     screen.operator_event.clear()
     screen.show_popup_signal.emit(

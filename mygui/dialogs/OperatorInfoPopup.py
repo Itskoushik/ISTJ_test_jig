@@ -70,15 +70,15 @@ class OperatorInfoPopup(QDialog):
         # ===============================
         # MESSAGE
         # ===============================
-        message_label = QLabel(message)
-        message_label.setWordWrap(True)
-        message_label.setAlignment(Qt.AlignLeft)
-        message_label.setFont(QFont("Segoe UI", 11))
-        message_label.setStyleSheet("""
+        self.message_label = QLabel(message)
+        self.message_label.setWordWrap(True)
+        self.message_label.setAlignment(Qt.AlignLeft)
+        self.message_label.setFont(QFont("Segoe UI", 11))
+        self.message_label.setStyleSheet("""
             color: #1a1a1a;
             padding: 6px 4px;
         """)
-        main_layout.addWidget(message_label)
+        main_layout.addWidget(self.message_label)
 
         # ===============================
         # BUTTONS
