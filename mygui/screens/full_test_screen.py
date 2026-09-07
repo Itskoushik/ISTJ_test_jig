@@ -1,3 +1,5 @@
+import traceback
+import re
 from dialogs.calibration_popup import CalibrationPopup
 from dialogs.test_completion_dialog import TestCompletionModal
 from dialogs.abort_test_dialog import AbortTestConfirmationPopup
@@ -6,15 +8,17 @@ from dialogs.OperatorInfoPopup import OperatorInfoPopup
 from dialogs.logs_viewer_dialog import LogsViewerDialog
 from threading import Event
 from core.logger import Logger
-from core.paths import RESOURCES_DIR, LOGS_DIR,SESSION_FILE
+from core.paths import RESOURCES_DIR,TEST_LOGS_DIR,SESSION_FILE
 from core.stm32_commands import STM32RelayController
-from core.excel_logger import create_model_report,finalize_report,write_excel
-
-
+from core.excel_logger import create_model_report,finalize_report,write_excel,has_any_fail_in_report,rename_report
+from core.apx_recovery import install_apx_recovery_hooks, remove_apx_recovery_hooks
+from core.relay_hooks import install_relay_hooks, remove_relay_hooks
+from devices.apx_analyzer import generator_control, set_generator_scale_factor
+from datetime import datetime as dt
 import time
 from datetime import datetime
-from PyQt5.QtGui import QFont, QPixmap, QColor, QIcon
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QSize, QThread
+from PyQt5.QtGui import *
+from PyQt5.QtCore import *
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QComboBox, QDialog,
@@ -38,10 +42,9 @@ from tests import (
     box_init,
     jb_seq
 )
-
-from devices.apx_analyzer import configure_apx,generator_control
-
-
+from core.stm32_commands import STM32RelayController
+from core.relay_state_tracker import RelayStateTracker
+from core.tuning_workflow import remove_tuning_hooks
 
 class PSUAutomationThread(QThread):
     def __init__(self, screen):
@@ -60,7 +63,17 @@ class InitializationThread(QThread):
     def run(self):
         self.screen.run_initialization()
 
+class AbortWorkerThread(QThread):
+    finished = pyqtSignal()
 
+    def __init__(self, screen, reset_relays: bool):
+        super().__init__()
+        self.screen = screen
+        self.reset_relays = reset_relays
+
+    def run(self):
+        self.screen.abort_test_internal(self.reset_relays)
+        self.finished.emit()
 # ============================================================================
 # SCREEN 4: FULL TEST SCREEN (MODIFIED HEADER WITH BACK BUTTON)
 # ============================================================================
@@ -73,14 +86,33 @@ class FullTestScreen(QMainWindow):
     return_to_test_selection = pyqtSignal()
     return_to_connection = pyqtSignal()
     log_signal = pyqtSignal(str, bool) 
-    show_popup_signal = pyqtSignal(str, str, object, str, object)
+    show_popup_signal = pyqtSignal([str, str, object, str, object],
+                               [str, str, object, str, object, bool],
+                               [str, str, object, str, object, bool, int])
+    update_popup_signal = pyqtSignal(str)
+    completion_signal = pyqtSignal()
+    _trigger_queue_signal = pyqtSignal() 
+    
 
 
 
     
     def __init__(self):
         super().__init__()
-        self.show_popup_signal.connect(self.show_operator_popup)
+        self.show_popup_signal[str, str, object, str, object, bool, int].connect(
+        lambda a, b, c, d, e, f, g: self.show_operator_popup(a, b, c, d, e, f, g)
+        )
+
+        self.show_popup_signal[str, str, object, str, object, bool].connect(
+            self.show_operator_popup
+        )
+
+        self.show_popup_signal[str, str, object, str, object].connect(
+            self.show_operator_popup
+        )
+
+        self._trigger_queue_signal.connect(self._process_popup_queue)
+        self.update_popup_signal.connect(self.update_active_popup)
         # ================= SESSION READ =================
         try:
             with open(SESSION_FILE, "r") as f:
@@ -97,23 +129,41 @@ class FullTestScreen(QMainWindow):
         self.psu_lock = Lock()
         self.voltage_monitor_thread = None
         self.voltage_stop_event = Event()
+        self._psu_shutdown_lock = Lock()
+        self._psu_shutdown_in_progress = False
+        self._reconnect_generation = 0
 
         self.operator_event = Event()
+        self._reconnect_event = Event() 
+        self._abort_pending_event = Event()     # NEW
+        self._abort_pending_event.set()         # NEW
+        self._awaiting_reconnect_ack = False
         self.device_listeners = []
         self.overall_test_passed = True
         self.logs_history = [] # To store (timestamp, message, is_error)
         self._disconnect_in_progress = False
+        self._disconnect_done = False          # ← ADD THIS (missing in full_test)
+        self._psu_error_handled = False        # ← ADD THIS (missing in full_test)
+        self._reconnect_in_progress = False
+        self._reconnect_lock = Lock()   # ADD THIS# ← ADD THIS (missing in full_test)
+        self._psu_ready_event = Event()
+        self._psu_ready_event.set()
+        self._popup_queue = []
+        self._popup_queue_lock = Lock()
+        self._popup_busy = False
         self.abort_event = Event()   # ✅ For immediate termination request
         self.psu_thread = None       # ✅ Track the running automation thread
         self.init_thread = None
 
 
         self.setWindowTitle("HAL - Full Test")
-        self.setGeometry(50, 50, 1400, 950)
+        self.setWindowIcon(QIcon(str(RESOURCES_DIR / "istj.png")))
         self.setMinimumSize(QSize(1000, 750))
         self.setStyleSheet("background-color: #f5f5f5;")
+        self.showMaximized()
         self.log_signal.connect(self.append_log)
-        self.logger = Logger(LOGS_DIR / f"test_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        self.completion_signal.connect(self.show_test_completion)
+        self.logger = Logger(TEST_LOGS_DIR / f"test_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
         self.test_running = False
         self.voltage_value = 0.0
         self.current_value = 0.0
@@ -127,7 +177,8 @@ class FullTestScreen(QMainWindow):
         self.psu_inst = None
         self.rm = pyvisa.ResourceManager()
 
-        
+        self.channel_ocp_limits = {}
+        self._ocp_tripped_channels = set()
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
@@ -181,6 +232,7 @@ class FullTestScreen(QMainWindow):
         self.back_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.back_btn.setFont(QFont("Arial", 9, QFont.Bold))
         self.back_btn.setIconSize(QSize(18, 18))
+        self.back_btn.setFocusPolicy(Qt.NoFocus)
         back_icon = QPixmap(str(RESOURCES_DIR / "backarr.png"))
         self.back_btn.setIcon(QIcon(back_icon))
         self.back_btn.setText("Back ")
@@ -202,7 +254,7 @@ class FullTestScreen(QMainWindow):
         """)
         self.back_btn.clicked.connect(self.on_back_clicked)
         top_layout.addWidget(self.back_btn, 0, Qt.AlignRight | Qt.AlignVCenter)
-
+        
         # Power Supply info in center-right (after Back button)
         self.voltage_label = QLabel("Power Supply: 0.0 V | 0.0 A")
         self.voltage_label.setFont(QFont("Arial", 11, QFont.Bold))
@@ -226,6 +278,7 @@ class FullTestScreen(QMainWindow):
         disconnect_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         disconnect_btn.setFont(QFont("Arial", 9, QFont.Bold))
         disconnect_btn.setIconSize(QSize(18, 18))
+        disconnect_btn.setFocusPolicy(Qt.NoFocus)
         disconnect_icon = QPixmap(str(RESOURCES_DIR / "disconnect.png"))
         if not disconnect_icon.isNull():
             disconnect_btn.setIcon(QIcon(disconnect_icon))
@@ -341,7 +394,7 @@ class FullTestScreen(QMainWindow):
         alhx_model_label.setStyleSheet("color: #374151; background-color: transparent; border: none; padding: 0px; margin: 0px;")
 
         self.alhx_combo = QComboBox()
-        self.alhx_combo.addItems(["ALH1", "ALH2", "ALH3"])
+        self.alhx_combo.addItems(["N200 - ALH1", "N200 - ALH2", "N200 - ALH3"])
         self.alhx_combo.setMinimumHeight(32)
         self.alhx_combo.setFont(QFont("Arial", 9))
         self.alhx_combo.setStyleSheet("""
@@ -398,6 +451,11 @@ class FullTestScreen(QMainWindow):
                 color: #999999;
             }
         """)
+        self.alhx_serial.setValidator(QRegExpValidator(QRegExp("[A-Za-z0-9]*")))
+        self.alhx_serial.editingFinished.connect(
+            lambda: self.alhx_serial.setText(self.alhx_serial.text().upper())
+        )
+        self.alhx_serial.returnPressed.connect(lambda: self.mod_combo.setFocus())
 
         config_grid.addWidget(alhx_sn_label, 1, 0, Qt.AlignRight | Qt.AlignVCenter)
         config_grid.addWidget(self.alhx_serial, 1, 1, Qt.AlignLeft | Qt.AlignVCenter)
@@ -409,26 +467,29 @@ class FullTestScreen(QMainWindow):
         mod_alhx_label.setMinimumWidth(120)
         mod_alhx_label.setStyleSheet("color: #374151; background-color: transparent; border: none; padding: 0px; margin: 0px;")
 
-        self.mod_combo = QComboBox()
-        self.mod_combo.addItems(["02", "03", "04", "05"])
+        self.mod_combo = QLineEdit()
+        self.mod_combo.setPlaceholderText("e.g. 02")
         self.mod_combo.setMinimumHeight(32)
+        self.mod_combo.setMaxLength(2)
         self.mod_combo.setFont(QFont("Arial", 9))
+        self.mod_combo.setValidator(QRegExpValidator(QRegExp("[0-9]{0,2}")))
+        self.mod_combo.editingFinished.connect(
+            lambda: self.mod_combo.setText(self.mod_combo.text().strip().zfill(2) if self.mod_combo.text().strip() else "")
+        )
+        self.mod_combo.returnPressed.connect(self._focus_after_mod_combo)
         self.mod_combo.setStyleSheet("""
-            QComboBox {
+            QLineEdit {
                 border: 1px solid #d0d0d0;
                 border-radius: 3px;
                 padding: 5px 8px;
                 background-color: #ffffff;
                 color: #333;
             }
-            QComboBox:focus {
+            QLineEdit:focus {
                 border: 1px solid #1a5da8;
                 background-color: #fafbfc;
             }
-            QComboBox::drop-down {
-                border: none;
-            }
-            QComboBox:disabled {
+            QLineEdit:disabled {
                 background-color: #e8e8e8;
                 border: 1px solid #d0d0d0;
                 color: #999999;
@@ -450,7 +511,7 @@ class FullTestScreen(QMainWindow):
         jbox_label.setStyleSheet("color: #374151; background-color: transparent; border: none; padding: 0px; margin: 0px;")
 
         self.jbox_combo = QComboBox()
-        self.jbox_combo.addItems(["No Junction Box", "ALH4"])
+        self.jbox_combo.addItems(["No Junction Box", "N200 - ALH4"])
         self.jbox_combo.setMinimumHeight(32)
         self.jbox_combo.setFont(QFont("Arial", 9))
         self.jbox_combo.setStyleSheet("""
@@ -508,7 +569,11 @@ class FullTestScreen(QMainWindow):
                 color: #999999;
             }
         """)
-
+        self.jbox_serial.setValidator(QRegExpValidator(QRegExp("[A-Za-z0-9]*")))
+        self.jbox_serial.editingFinished.connect(
+            lambda: self.jbox_serial.setText(self.jbox_serial.text().upper())
+        )
+        self.jbox_serial.returnPressed.connect(lambda: self.mod_jbox_combo.setFocus())
         config_grid.addWidget(jbox_sn_label, 1, 2, Qt.AlignRight | Qt.AlignVCenter)
         config_grid.addWidget(self.jbox_serial, 1, 3, Qt.AlignLeft | Qt.AlignVCenter)
 
@@ -519,26 +584,29 @@ class FullTestScreen(QMainWindow):
         mod_jbox_label.setMinimumWidth(120)
         mod_jbox_label.setStyleSheet("color: #374151; background-color: transparent; border: none; padding: 0px; margin: 0px;")
 
-        self.mod_jbox_combo = QComboBox()
-        self.mod_jbox_combo.addItems(["00", "01"])
+        self.mod_jbox_combo = QLineEdit()
+        self.mod_jbox_combo.setPlaceholderText("e.g. 01")
         self.mod_jbox_combo.setMinimumHeight(32)
         self.mod_jbox_combo.setFont(QFont("Arial", 9))
+        self.mod_jbox_combo.setMaxLength(2)
+        self.mod_jbox_combo.setValidator(QRegExpValidator(QRegExp("[0-9]{0,2}")))
+        self.mod_jbox_combo.editingFinished.connect(
+            lambda: self.mod_jbox_combo.setText(self.mod_jbox_combo.text().strip().zfill(2) if self.mod_jbox_combo.text().strip() else "")
+        )
+        self.mod_jbox_combo.returnPressed.connect(lambda: self.lock_btn.setFocus())
         self.mod_jbox_combo.setStyleSheet("""
-            QComboBox {
+            QLineEdit {
                 border: 1px solid #d0d0d0;
                 border-radius: 3px;
                 padding: 5px 8px;
                 background-color: #ffffff;
                 color: #333;
             }
-            QComboBox:focus {
+            QLineEdit:focus {
                 border: 1px solid #1a5da8;
                 background-color: #fafbfc;
             }
-            QComboBox::drop-down {
-                border: none;
-            }
-            QComboBox:disabled {
+            QLineEdit:disabled {
                 background-color: #e8e8e8;
                 border: 1px solid #d0d0d0;
                 color: #999999;
@@ -568,6 +636,7 @@ class FullTestScreen(QMainWindow):
         self.lock_btn = QPushButton("Lock On")
         self.lock_btn.setFixedSize(200, 40)
         self.lock_btn.setFont(QFont("Arial", 10, QFont.Bold))
+        self.lock_btn.setFocusPolicy(Qt.NoFocus)
         self.lock_btn.setStyleSheet("""
             QPushButton {
                 background-color: #1a5da8;
@@ -602,6 +671,7 @@ class FullTestScreen(QMainWindow):
         self.start_btn.setMinimumHeight(44)
         self.start_btn.setFont(QFont("Arial", 10, QFont.Bold))
         self.start_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.start_btn.setFocusPolicy(Qt.NoFocus)
         self.start_btn.setStyleSheet("""
             QPushButton:disabled {
                 background-color: #9e9e9e;
@@ -630,6 +700,7 @@ class FullTestScreen(QMainWindow):
         abort_btn.setFont(QFont("Arial", 10, QFont.Bold))
         abort_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         abort_btn.setIconSize(QSize(18, 18))
+        abort_btn.setFocusPolicy(Qt.NoFocus)
         abort_icon = QPixmap(str(RESOURCES_DIR / "abort.png"))
         if not abort_icon.isNull():
             abort_btn.setIcon(QIcon(abort_icon))
@@ -680,6 +751,7 @@ class FullTestScreen(QMainWindow):
         view_logs_btn.setMinimumHeight(44)
         view_logs_btn.setFont(QFont("Arial", 10, QFont.Bold))
         view_logs_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        view_logs_btn.setFocusPolicy(Qt.NoFocus)
         view_logs_btn.setStyleSheet("""
             QPushButton {
                 background-color: #1976d2;
@@ -736,9 +808,9 @@ class FullTestScreen(QMainWindow):
         self.log_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.log_text.setStyleSheet("""
             QTextEdit {
-                border: 1px solid #d0d0d0;
-                background-color: #fafbfc;
-                color: #333;
+                border: 1px solid #2a2a2a;
+                background-color: #1a1a1a;
+                color: #cccccc;
                 border-radius: 4px;
                 padding: 8px;
             }
@@ -758,9 +830,15 @@ class FullTestScreen(QMainWindow):
     def is_junction_box_mode(self) -> bool:
         station = self.alhx_combo.currentText().strip().upper()
         jbox = self.jbox_combo.currentText().strip().upper()
-        return station in ["ALH1", "ALH2", "ALH3"] and jbox == "ALH4"
+        return station in ["N200 - ALH1", "N200 - ALH2", "N200 - ALH3"] and jbox == "N200 - ALH4"
 
-    
+    def _focus_after_mod_combo(self):
+        """Enter in mod_combo → jump into Junction Box fields if enabled, else the lock button."""
+        if self.jbox_serial.isEnabled():
+            self.jbox_serial.setFocus()
+        else:
+            self.lock_btn.setFocus()
+
     def open_logs_window(self):
         """
         Show detailed logs popup (exact red/green as running logs)
@@ -783,7 +861,7 @@ class FullTestScreen(QMainWindow):
 
 
     # ========================================================================
-    # STEP 1: CONTROL PANEL VALIDATION
+    # CONTROL PANEL VALIDATION
     # ========================================================================
     def validate_control_panel(self) -> bool:
         """
@@ -810,8 +888,8 @@ class FullTestScreen(QMainWindow):
             return False
         
         # Check ALHx MOD
-        if not self.mod_combo.currentText():
-            self.show_validation_error("ALHx Module (MOD) must be selected")
+        if not self.mod_combo.text().strip():
+            self.show_validation_error("ALHx Module (MOD) must be Filled")
             return False
         
         # Check Junction Box dependent fields
@@ -822,8 +900,8 @@ class FullTestScreen(QMainWindow):
                 self.show_validation_error("Junction Box Serial Number must be filled")
                 return False
             
-            if not self.mod_jbox_combo.currentText():
-                self.show_validation_error("Junction Box Module (MOD) must be selected")
+            if not self.mod_jbox_combo.text().strip():
+                self.show_validation_error("Junction Box Module (MOD) must be filled")
                 return False
         
         # Check if configuration is locked
@@ -834,33 +912,42 @@ class FullTestScreen(QMainWindow):
         return True
 
     def start_voltage_monitoring(self):
-        if self.voltage_monitor_thread and self.voltage_monitor_thread.isRunning():
+        if self.voltage_monitor_thread is not None:
+            if self.voltage_monitor_thread.isRunning():
+                return                           # already running, don't double-start
+            self.voltage_monitor_thread = None   # dead thread, clean up
+  
+        if self.voltage_stop_event.is_set():
+            self.voltage_stop_event.clear()# ← MUST clear BEFORE creating thread
+        if self._disconnect_in_progress or self.abort_event.is_set():
             return
-
-        self.voltage_stop_event.clear()
-
         self.voltage_monitor_thread = VoltageMonitorThread(
-            psu_send_command=self.psu_send_command,
-            stop_event=self.voltage_stop_event
-        )
-
-        self.voltage_monitor_thread.voltage_signal.connect(
-            self.on_voltage_update
-        )
-        self.voltage_monitor_thread.error_signal.connect(
-            lambda e: self.log_signal.emit(f"Voltage monitor error: {e}", True)
-        )
-
+        psu_send_command=self.psu_send_command,
+        stop_event=self.voltage_stop_event,
+        channel=self.current_channel or 1      # ← add this
+    )
+        self.voltage_monitor_thread.voltage_signal.connect(self.on_voltage_update)
         self.voltage_monitor_thread.start()
         self.log_signal.emit("Live voltage monitoring STARTED", False)
 
 
+    # AFTER (fixed — wait for thread to actually finish before releasing):
     def stop_voltage_monitoring(self):
-        if self.voltage_monitor_thread:
-            self.voltage_stop_event.set()
-            self.voltage_monitor_thread.wait()
-            self.voltage_monitor_thread = None
-            self.log_signal.emit("Live voltage monitoring STOPPED", False)
+        t = self.voltage_monitor_thread
+        self.voltage_monitor_thread = None
+
+        self.voltage_stop_event.set()
+
+        if t is not None:
+            t.stop()
+            t.wait(2000)
+
+        # Reset readings to zero once monitoring stops
+        self.voltage_value = 0.0
+        self.current_value = 0.0
+        self.update_voltage_label()
+
+        self.log_signal.emit("Live voltage monitoring STOPPED", False)
 
     
     
@@ -875,51 +962,492 @@ class FullTestScreen(QMainWindow):
     
     def show_validation_error(self, message: str):
         """
-        Display validation error message in popup dialog.
+        Display validation error message in a custom-styled popup dialog.
         
         Args:
             message: Error message to display
         """
-        QMessageBox.warning(self, "Validation Error", message, QMessageBox.Ok)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Validation Error")
+        dlg.setModal(True)
+        dlg.setFixedWidth(420)
+        dlg.setStyleSheet("QDialog { background-color: #ffffff; }")
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(24, 20, 24, 24)
+        layout.setSpacing(16)
+
+        # ── Icon (info.png inside a soft red circle, matching the reference UI) ──
+        icon_label = QLabel()
+        icon_label.setAlignment(Qt.AlignCenter)
+        icon_label.setFixedSize(72, 72)
+        icon_label.setStyleSheet("""
+            QLabel {
+                background-color: #fee2e2;
+                border-radius: 36px;
+            }
+        """)
+        icon_pixmap = QPixmap(str(RESOURCES_DIR / "info.png"))
+        if not icon_pixmap.isNull():
+            icon_label.setPixmap(
+                icon_pixmap.scaled(40, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+        icon_row = QHBoxLayout()
+        icon_row.addStretch()
+        icon_row.addWidget(icon_label)
+        icon_row.addStretch()
+        layout.addLayout(icon_row)
+
+        # ── Title ──
+        title_label = QLabel("Validation Error")
+        title_label.setFont(QFont("Arial", 15, QFont.Bold))
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet("color: #d32f2f; background-color: transparent; border: none;")
+        layout.addWidget(title_label)
+
+        # ── Message ──
+        body_label = QLabel(message)
+        body_label.setWordWrap(True)
+        body_label.setAlignment(Qt.AlignCenter)
+        body_label.setFont(QFont("Arial", 10))
+        body_label.setStyleSheet("color: #374151; background-color: transparent; border: none;")
+        layout.addWidget(body_label)
+
+        # ── OK button, centered ──
+        ok_row = QHBoxLayout()
+        ok_row.addStretch()
+        ok_btn = QPushButton("OK")
+        ok_btn.setFixedSize(120, 40)
+        ok_btn.setFont(QFont("Arial", 10, QFont.Bold))
+        ok_btn.setCursor(Qt.PointingHandCursor)
+        ok_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1a5da8;
+                color: white;
+                border: none;
+                border-radius: 6px;
+            }
+            QPushButton:hover { background-color: #154a8a; }
+            QPushButton:pressed { background-color: #0f3860; }
+        """)
+        ok_btn.clicked.connect(dlg.accept)
+        ok_row.addWidget(ok_btn)
+        ok_row.addStretch()
+        layout.addLayout(ok_row)
+
+        dlg.exec_()
 
     # ========================================================================
-    # STEP 2: PSU AUTOMATION METHODS (DP832 DATASHEET COMPLIANT)
+    # PSU AUTOMATION METHODS (DP832 DATASHEET COMPLIANT)
     # ========================================================================
     from psu.psu_helpers import find_psu
   
-    def psu_send_command(self, command: str) -> str:
-
-        try:
-
-            if not self.psu_inst:
-                self.log_signal.emit("ERROR: PSU not initialized", True)
+    def psu_send_command(self, command: str, _retries: int = 3, critical: bool = True) -> str:
+    # ── Block directly on the event (no race with _reconnect_in_progress flag) ──
+        if not self._psu_ready_event.is_set():
+            self._psu_ready_event.wait(timeout=300)
+            if not self._psu_ready_event.is_set() or self.abort_event.is_set():
                 return ""
-
-            with self.psu_lock:
-
-                if "?" in command:
-                    return self.psu_inst.query(command).strip()
-                else:
-                    self.psu_inst.write(command)
-                    return ""
-
-        except Exception as e:
-
-            if not self._disconnect_in_progress:
-                self._disconnect_in_progress = True
-
-                self.log_signal.emit(f"PSU COMMUNICATION LOST: {e}", True)
-
-                QTimer.singleShot(
-                    0,
-                    lambda: self.on_device_disconnected(
-                        DeviceType.PSU,
-                        "Power Supply communication lost.\nTest aborted."
-                    )
-                )
-
+        if getattr(self, "_psu_error_handled", False):
+            return ""
+        if getattr(self, "_disconnect_in_progress", False):
+            return ""
+        if self.abort_event.is_set():
+            return ""
+        if not self.psu_inst:
             return ""
 
+        for attempt in range(1, _retries + 1):
+            try:
+                with self.psu_lock:
+                    if "?" in command:
+                        return self.psu_inst.query(command).strip()
+                    else:
+                        self.psu_inst.write(command)
+                        return ""
+            except Exception as exc:
+                exc_str = str(exc).lower()
+                print(f"[PSU] I/O error (attempt {attempt}/{_retries}): {exc}")
+
+                # ── Soft SCPI / command errors: log and skip, do NOT reconnect ──
+                _soft_errors = (
+                    "incorrect", "invalid", "undefined header",
+                    "syntax error", "query interrupted", "query unterminated",
+                    "command error", "execution error", "otp", "ocp", "ovp",
+                )
+                if any(token in exc_str for token in _soft_errors):
+                    print(f"[PSU] Soft SCPI error — skipping reconnect: {exc}")
+                    return ""
+
+                if attempt < _retries:
+                    time.sleep(0.3)
+                    continue
+
+                # ── Non-critical callers (the voltage-monitor poll) never escalate —
+                # a single slow/failed background reading is not proof the PSU is gone.
+                if not critical:
+                    print(f"[PSU] Non-critical command failed after retries — skipping reconnect: {exc}")
+                    return ""
+
+                # ── Only trigger reconnect for genuine transport-level failures ──
+                _hard_errors = (
+                    "visaioerror", "resource not found", "timeout",
+                    "not connected", "unable to connect", "no listeners",
+                    "vi_error", "access denied", "object reference",
+                )
+                if not any(token in exc_str for token in _hard_errors):
+                    print(f"[PSU] Non-transport error after retries — skipping reconnect: {exc}")
+                    return ""
+
+                if getattr(self, "_reconnect_in_progress", False):
+                    return ""
+                self._psu_error_handled = True
+                import threading
+                threading.Thread(
+                    target=self._background_reconnect,
+                    daemon=True,
+                    name="PSU-reconnect"
+                ).start()
+                return ""
+        return ""
+    
+    def _background_reconnect(self, max_attempts: int = 10, delay: float = 5.0):
+        lock = getattr(self, "_reconnect_lock", None)
+        if lock is None:
+            return
+        acquired = lock.acquire(blocking=False)
+        if not acquired:
+            print("[PSU RECONNECT] Already in progress — skipping")
+            return
+        self._reconnect_in_progress = True
+        self._psu_ready_event.clear()
+        my_generation = self._reconnect_generation
+        try:
+            self.voltage_stop_event.set()
+            t = self.voltage_monitor_thread
+            self.voltage_monitor_thread = None
+            if t is not None:
+                t.stop()
+                if t is not QThread.currentThread():
+                    t.wait(3000)
+
+            for listener in getattr(self, "device_listeners", []):
+                try:
+                    listener.stop()
+                except Exception:
+                    pass
+            self.device_listeners = []
+
+            saved_psu_resource = None
+            try:
+                if self.psu_inst:
+                    saved_psu_resource = self.psu_inst.resource_name
+            except Exception:
+                pass
+            try:
+                if self.psu_inst:
+                    self.psu_inst.close()
+            except Exception:
+                pass
+            self.psu_inst = None
+            # Do NOT close self.rm here — it may be the same underlying VISA
+            # session the oscilloscope's ResourceManager shares on this backend.
+            # Closing it here has been observed to silently kill osc_conn's live
+            # session, causing a false oscilloscope disconnect right after a PSU
+            # reconnect. self.rm stays open and gets reused for the reconnect.
+
+            saved_channel = getattr(self, "current_channel", 1) or 1
+            QTimer.singleShot(0, lambda: self._show_psu_disconnect_toast())
+
+            self._awaiting_reconnect_ack = True
+            self._reconnect_event.clear()
+
+            self._queue_popup(
+                "⚠ PSU Disconnected",
+                "The PSU connection has been lost.\n\n"
+                "Please ensure:\n"
+                "  • PSU USB cable is firmly connected\n"
+                "  • PSU power switch is ON\n"
+                "  • All power cables are seated properly\n\n"
+                "Click OK when PSU is connected and ready — "
+                "the system will then attempt to reconnect automatically.",
+                None, "ok", None,
+                callback=lambda result, popup: self._reconnect_event.set()
+            )
+
+            self._reconnect_event.wait()
+            self._awaiting_reconnect_ack = False
+            self.log_signal.emit("🔌 Operator confirmed PSU ready — attempting reconnect...", False)
+
+            import pyvisa as _pyvisa
+            if self.rm is None:
+                self.rm = _pyvisa.ResourceManager()
+
+            for attempt in range(1, max_attempts + 1):
+                if self.abort_event.is_set():
+                    return
+                print(f"[PSU RECONNECT] Attempt {attempt}/{max_attempts}...")
+                time.sleep(delay)
+                try:
+                    from psu.psu_helpers import find_psu_specific
+                    new_inst = None
+                    if saved_psu_resource:
+                        new_inst = find_psu_specific(saved_psu_resource, rm=self)
+                    if not new_inst:
+                        new_inst = self.find_psu()   # fallback: full scan
+                    if not new_inst:
+                        continue
+                    self.psu_inst = new_inst
+
+                    if self._reconnect_should_abort(my_generation):
+                        self.log_signal.emit(
+                            "[PSU RECONNECT] Abort/close active - refusing to restore outputs", True
+                        )
+                        self._safe_shutdown_all_psu_channels(context="reconnect aborted")
+                        return
+
+                    self._safe_set_remote();                       time.sleep(0.2)
+                    with self.psu_lock:
+                        self.psu_inst.write("SYST:LOCK ON");       time.sleep(0.2)
+                        self.psu_inst.write("INST:NSEL 1");        time.sleep(0.05)
+                        self.psu_inst.write("SOUR1:VOLT 28.0")
+                        self.psu_inst.write("SOUR1:CURR 2.6")
+                        self.psu_inst.write("OUTP ON");            time.sleep(0.1)
+
+                    if self._reconnect_should_abort(my_generation):
+                        self.log_signal.emit(
+                            "[PSU RECONNECT] Abort/close active - refusing to restore CH3", True
+                        )
+                        self._safe_shutdown_all_psu_channels(context="reconnect aborted mid-restore")
+                        return
+
+                    with self.psu_lock:
+                        self.psu_inst.write("INST:NSEL 3");        time.sleep(0.05)
+                        self.psu_inst.write("SOUR3:VOLT 5.0")
+                        self.psu_inst.write("SOUR3:CURR 1.0")
+                        self.psu_inst.write("OUTP ON");            time.sleep(0.1)
+                        self.psu_inst.write(f"INST:NSEL {saved_channel}"); time.sleep(0.1)
+
+                    try:
+                        sync_ok = STM32RelayController.send_with_retry(STM32RelayController.sync)
+                        if sync_ok:
+                            self.log_signal.emit("✅ ISTJ sync confirmed after PSU restore", False)
+                        else:
+                            self.log_signal.emit("⚠ ISTJ sync failed after PSU restore — relays may be unreliable", True)
+                    except Exception as sync_err:
+                        self.log_signal.emit(f"⚠ ISTJ sync error: {sync_err}", True)
+
+                    self._psu_error_handled = False
+
+                    self._awaiting_reconnect_ack = True
+                    self._reconnect_event.clear()
+
+                    self._queue_popup(
+                        "⚠ PSU Reconnected",
+                        "PSU was disconnected and has been reconnected.\n\n"
+                        "Click OK to restore relay states and resume the test.",
+                        None, "ok", None,
+                        callback=lambda result, popup: self._reconnect_event.set()
+                    )
+
+                    self._reconnect_event.wait()
+                    self._awaiting_reconnect_ack = False
+
+                    self.log_signal.emit("🔁 Restoring relay states after PSU reconnect…", False)
+                    relay_ok = RelayStateTracker.restore_all(self)
+                    if relay_ok:
+                        self.log_signal.emit("✅ Relay states restored successfully.", False)
+                    else:
+                        self.log_signal.emit("⚠ Some relays may not have restored — check manually.", True)
+
+                    self.voltage_stop_event.clear()
+                    self.start_voltage_monitoring()
+
+                    try:
+                        psu_listener = PSUListener(self.psu_inst, self.psu_lock)
+                        psu_listener.disconnected.connect(self.on_device_disconnected)
+                        # after
+                        self.device_listeners = [
+                            l for l in self.device_listeners if not isinstance(l, PSUListener)
+                        ] + [psu_listener]
+                        psu_listener.start()
+                    except Exception as le:
+                        print(f"[PSU RECONNECT] Listener restart failed: {le}")
+
+                    self._awaiting_reconnect_ack = True
+                    self._reconnect_event.clear()
+
+                    self._queue_popup(
+                        "✅ PSU Reconnected Successfully",
+                        "PSU has been reconnected and relay states have been restored.\n\n"
+                        "The test will resume from where it paused.\n\n"
+                        "Click OK to continue.",
+                        None, "ok", None,
+                        callback=lambda result, popup: self._reconnect_event.set()
+                    )
+
+                    # after
+                    self._reconnect_event.wait()
+                    self._awaiting_reconnect_ack = False
+                    self._psu_ready_event.set()
+                    self.log_signal.emit("▶ PSU reconnected — test resuming.", False)
+                    return
+
+                except Exception as exc:
+                    print(f"[PSU RECONNECT] Attempt {attempt} failed: {exc}")
+                    self.log_signal.emit(
+                        f"🔁 PSU reconnect attempt {attempt}/{max_attempts} failed: {exc}", True
+                    )
+
+            # All attempts failed
+            print("[PSU RECONNECT] ✗ All attempts failed — aborting test")
+            self.log_signal.emit(
+                "❌ PSU reconnect: all rediscovery attempts failed — see attempt log above.", True
+            )
+            self.log_signal.emit("❌ PSU reconnect failed — test aborted.", True)
+            self._disconnect_in_progress = True
+            self.abort_event.set()
+            self.voltage_stop_event.set()
+            QTimer.singleShot(0, self._show_psu_failed_dialog)
+
+        finally:
+            self._reconnect_in_progress = False
+            lock.release()
+
+    def _show_psu_failed_dialog(self):
+        self._force_close_all_dialogs()
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Critical)
+        msg.setWindowTitle("PSU Disconnected")
+        msg.setText(
+            "PSU could not be reconnected after multiple attempts.\n"
+            "Test aborted. Please check the PSU connection and restart."
+        )
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.buttonClicked.connect(
+            lambda _: (
+                self.return_to_connection.emit(),
+                QTimer.singleShot(100, self.close),
+            )
+        )
+        msg.exec_()
+    # AFTER the closing of _show_psu_failed_dialog method, ADD:
+
+    def _show_psu_disconnect_toast(self):
+        """Non-blocking top-right toast when PSU disconnects."""
+        toast = QWidget(self, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        toast.setAttribute(Qt.WA_DeleteOnClose)
+        toast.setAttribute(Qt.WA_ShowWithoutActivating)
+        toast.setFixedWidth(320)
+        toast.setStyleSheet("""
+            QWidget {
+                background-color: #1e1e2e;
+                border: 1px solid #d32f2f;
+                border-radius: 8px;
+            }
+            QLabel { border: none; background: transparent; }
+        """)
+        layout = QVBoxLayout(toast)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(4)
+        title_row = QHBoxLayout()
+        icon_lbl = QLabel("⚠")
+        icon_lbl.setStyleSheet("color:#d32f2f; font-size:14px;")
+        title_lbl = QLabel("PSU Disconnected")
+        title_lbl.setFont(QFont("Arial", 9, QFont.Bold))
+        title_lbl.setStyleSheet("color:#f38ba8;")
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(20, 20)
+        close_btn.setStyleSheet("""
+            QPushButton { background:transparent; color:#585b70; border:none; font-size:11px; }
+            QPushButton:hover { color:#cdd6f4; }
+        """)
+        close_btn.clicked.connect(toast.close)
+        title_row.addWidget(icon_lbl)
+        title_row.addWidget(title_lbl, 1)
+        title_row.addWidget(close_btn)
+        layout.addLayout(title_row)
+        body_lbl = QLabel("PSU connection lost. Attempting to reconnect automatically…")
+        body_lbl.setWordWrap(True)
+        body_lbl.setStyleSheet("color:#cdd6f4; font-size:8pt;")
+        layout.addWidget(body_lbl)
+        toast.adjustSize()
+        pr = self.geometry()
+        toast.move(pr.right() - toast.width() - 16, pr.top() + 80)
+        toast.show()
+        self._psu_toast = toast
+        QTimer.singleShot(8000, toast.close)    
+        
+    def _queue_popup(self, title, message, image_path, buttons, timer_seconds, callback=None):
+        with self._popup_queue_lock:
+            self._popup_queue.append((title, message, image_path, buttons, timer_seconds, callback))
+        self._trigger_queue_signal.emit()
+    def update_active_popup(self, html_text: str):
+        popup = getattr(self, "active_popup", None)
+        if popup is not None:
+            try:
+                popup.set_dynamic_text(html_text)
+            except Exception:
+                pass
+    def _process_popup_queue(self):
+        if self._popup_busy:
+            return
+
+        # Once an abort has started, no more test-flow popups should ever
+        # appear — drop anything left queued instead of showing it.
+        if self.abort_event.is_set():
+            with self._popup_queue_lock:
+                self._popup_queue.clear()
+            return
+
+        with self._popup_queue_lock:
+            if not self._popup_queue:
+                return
+            title, message, image_path, buttons, timer_seconds, callback = self._popup_queue.pop(0)
+
+        self._popup_busy = True
+
+        try:
+            popup = OperatorInfoPopup(
+                title=title, message=message, image_path=image_path,
+                buttons=buttons, timer_seconds=timer_seconds, parent=self
+            )
+        except RuntimeError:
+            # Parent window itself is mid-teardown — nothing to show.
+            self._popup_busy = False
+            return
+
+        self.active_popup = popup
+
+        def handle_result(result):
+            self._popup_busy = False
+            if callback:
+                try:
+                    callback(result, popup)
+                except RuntimeError:
+                    pass   # popup's Qt widget was already destroyed
+                except Exception:
+                    pass
+            self._trigger_queue_signal.emit()
+
+        popup.finished.connect(handle_result)
+        popup.setWindowModality(Qt.NonModal)
+        popup.setWindowFlags(popup.windowFlags() | Qt.WindowStaysOnTopHint)
+        try:
+            popup.show()
+        except RuntimeError:
+            pass
+        QApplication.processEvents()
+        
+    def safe_handle_disconnect(self):
+        if getattr(self, "_disconnect_done", False):
+            return
+        if getattr(self, "_reconnect_in_progress", False):
+            return
+        self._disconnect_done = True
+        self.abort_event.set()
+        self.voltage_stop_event.set()
+        print("[SAFE DISCONNECT] Test aborted due to unrecoverable PSU error") 
 
     def freeze_psu_front_panel(self):
         """
@@ -930,6 +1458,14 @@ class FullTestScreen(QMainWindow):
         self.psu_send_command(PSUCommands.SYSTEM_LOCK_ON)
         self.log_signal.emit("PSU front panel LOCKED (SYST:LOCK ON)", False)
 
+    def _safe_set_remote(self):
+        try:
+            with self.psu_lock:
+                if self.psu_inst:
+                    self.psu_inst.write("SYST:REM")
+        except Exception as e:
+            print(f"[PSU] SYST:REM suppressed (already remote or benign): {e}")
+    
     def unfreeze_psu_front_panel(self):
         """
         Unlock PSU front panel to allow manual changes.
@@ -938,8 +1474,131 @@ class FullTestScreen(QMainWindow):
         """
         self.psu_send_command(PSUCommands.SYSTEM_LOCK_OFF)
         self.log_signal.emit("PSU front panel UNLOCKED (SYST:LOCK OFF)", False)
-    
+    def _safe_shutdown_all_psu_channels(self, context: str = "") -> bool:
+        """
+        Single authoritative PSU emergency shutdown path.
+        Used by abort_test_internal, closeEvent (all paths), and
+        on_device_disconnected. Never trusts a stale psu_inst blindly,
+        never claims success it didn't actually achieve, and sets
+        _psu_shutdown_in_progress immediately so any in-flight reconnect
+        thread refuses to restore outputs.
+        """
+        self._psu_shutdown_in_progress = True
+        try:
+            with self._psu_shutdown_lock:
+                print(f"[PSU SHUTDOWN] Starting emergency shutdown ({context})")
 
+                inst = self.psu_inst
+                inst_is_valid = False
+                if inst is not None:
+                    try:
+                        with self.psu_lock:
+                            inst.write("*CLS")
+                        inst_is_valid = True
+                        print("[PSU SHUTDOWN] Using current PSU connection")
+                    except Exception as e:
+                        print(
+                            f"[PSU SHUTDOWN] Existing PSU handle invalid - rediscovering PSU ({e})"
+                        )
+
+                if not inst_is_valid:
+                    try:
+                        if self.rm is None:
+                            import pyvisa as _pyvisa
+                            self.rm = _pyvisa.ResourceManager()
+                        inst = self.find_psu()
+                        if inst:
+                            self.psu_inst = inst
+                            print("[PSU SHUTDOWN] Fresh PSU handle acquired for shutdown")
+                        else:
+                            print(
+                                "[PSU SHUTDOWN] CRITICAL: PSU unavailable; channel state could not be commanded OFF"
+                            )
+                            return False
+                    except Exception as e:
+                        print(f"[PSU SHUTDOWN] CRITICAL: PSU rediscovery failed - {e}")
+                        return False
+
+                all_ok = True
+                for ch in (1, 2, 3):
+                    try:
+                        with self.psu_lock:
+                            inst.write(f"INST:NSEL {ch}")
+                            time.sleep(0.1)
+                            inst.write("OUTP OFF")
+                            time.sleep(0.1)
+                        print(f"[PSU SHUTDOWN] Ch{ch} OFF")
+                    except Exception as e:
+                        all_ok = False
+                        print(f"[PSU SHUTDOWN] FAILED: Ch{ch} OFF - {e}")
+
+                if all_ok:
+                    print(
+                        f"[PSU SHUTDOWN] All PSU channels OFF successfully ({context})"
+                    )
+                else:
+                    print(
+                        f"[PSU SHUTDOWN] CRITICAL: one or more channels could not be confirmed OFF ({context})"
+                    )
+                return all_ok
+        finally:
+            self._psu_shutdown_in_progress = False
+
+    def _reconnect_should_abort(self, my_generation: int) -> bool:
+        return (
+            self.abort_event.is_set()
+            or getattr(self, "_psu_shutdown_in_progress", False)
+            or getattr(self, "_disconnect_in_progress", False)
+            or not self.test_running
+            or my_generation != self._reconnect_generation
+        )
+    def _turn_off_psu_channels(self, channels, context: str = ""):
+        """
+        Turn off the given PSU channels using the EXISTING self.psu_inst
+        (the same handle opened in start_test / reconnect — never re-opened here).
+        Logs per-channel failures instead of swallowing them.
+        """
+        if not self.psu_inst:
+            self.log_signal.emit(
+                f"⚠ PSU OFF skipped{f' ({context})' if context else ''}: no active PSU handle",
+                True
+            )
+            return False
+
+        all_ok = True
+        with self.psu_lock:
+            for ch in channels:
+                try:
+                    self.psu_inst.write(f"INST:NSEL {ch}")
+                    time.sleep(0.1)
+                    self.psu_inst.write("OUTP OFF")
+                    time.sleep(0.1)
+                except Exception as e:
+                    all_ok = False
+                    self.log_signal.emit(f"⚠ Failed to turn OFF Ch{ch}: {e}", True)
+
+        if all_ok:
+            self.log_signal.emit(f"PSU OUTPUT TURNED OFF{f' ({context})' if context else ''}", False)
+        else:
+            self.log_signal.emit(
+                f"⚠ PSU OFF completed with errors{f' ({context})' if context else ''} — verify hardware manually",
+                True
+            )
+        return all_ok
+
+    # def set_channel_current_with_ocp(self, channel: int, current: float, margin: float = 0.2):
+    #     ocp_level = round(current + margin, 3)
+    #     self.psu_send_command(f"INST:NSEL {channel}")
+    #     time.sleep(0.05)
+    #     self.psu_send_command(f"SOUR{channel}:CURR {current}")
+    #     self.psu_send_command(f"SOUR{channel}:CURR:PROT {ocp_level}")
+    #     self.psu_send_command(f"SOUR{channel}:CURR:PROT:STAT ON")
+    #     self.channel_ocp_limits[channel] = ocp_level
+    #     self._ocp_tripped_channels.discard(channel)
+    #     self.log_signal.emit(
+    #         f"Ch{channel} OCP armed at {ocp_level}A (set {current}A + {margin}A margin)", False
+    #     )
+        
     def debug_active_channel(self, tag: str):
         try:
             ch = self.psu_send_command("INST:NSEL?")
@@ -954,7 +1613,6 @@ class FullTestScreen(QMainWindow):
         CHANNEL 1
         Voltage: 28V
         Current: 1.3A
-        Output ON until task completes
         """
 
         self.psu_send_command("*CLS")
@@ -962,33 +1620,16 @@ class FullTestScreen(QMainWindow):
         time.sleep(0.1)
 
         self.psu_send_command("SOUR1:VOLT 28.0")
-        self.psu_send_command("SOUR1:CURR 1.3")
+        # self.set_channel_current_with_ocp(1, 2.6)
 
         self.psu_send_command("OUTP ON")
         time.sleep(0.5)   # ⏳ let PSU settle
         self.start_voltage_monitoring()
         
         self.current_channel = 1
-        self.log_signal.emit("Ch1 OUTPUT ON (28V, 1.3A)", False)
+        self.log_signal.emit("Ch1 OUTPUT ON (28V, 2.6 A)", False)
         self.operator_event.clear()
-        # self.show_popup_signal.emit(
-        #     "Channel 1 Active",
-        #     "Channel 1 is ON at 28V.\nClick OK to proceed.",
-        #     None,"ok",None
-        # )
-        # self.operator_event.wait()
-        self.log_signal.emit("Operator confirmed Channel 1", False)
-        time.sleep(15)
-
-        
-
-
-        # -------------------------------------------------
-        # ADD YOUR LOGIC HERE
-        # Output remains ON until this logic completes
-        
-
-        
+        time.sleep(2)
 
     
     def worker_ch2_28v(self):
@@ -997,19 +1638,14 @@ class FullTestScreen(QMainWindow):
         time.sleep(0.1)
 
         self.psu_send_command("SOUR2:VOLT 28.0")
-        self.psu_send_command("SOUR2:CURR 1.3")
+        # self.set_channel_current_with_ocp(2, 2.0)
 
         self.psu_send_command("OUTP ON")
         time.sleep(0.5)   # ⏳ let PSU settle
         self.start_voltage_monitoring()
         self.current_channel = 2
-        self.log_signal.emit("Ch2 OUTPUT ON (28V, 1.3A)", False)
-        
-        # ADD YOUR LOGIC HERE
-        time.sleep(15)
-        self.psu_send_command("OUTP OFF")
-        self.stop_voltage_monitoring()
-        self.log_signal.emit("Ch2 OUTPUT OFF (28V step complete)", False)
+        self.log_signal.emit("Ch2 OUTPUT ON (28V, 2.0A)", False)
+
 
     def worker_ch2_12v(self):
         self.psu_send_command("*CLS")
@@ -1017,92 +1653,54 @@ class FullTestScreen(QMainWindow):
         time.sleep(0.1)
 
         self.psu_send_command("SOUR2:VOLT 12.0")
-        self.psu_send_command("SOUR2:CURR 1.3")
+        # self.set_channel_current_with_ocp(2, 2.0)
 
         self.psu_send_command("OUTP ON")
         time.sleep(0.5)   # ⏳ let PSU settle
         self.start_voltage_monitoring()
         self.current_channel = 2
-        self.log_signal.emit("Ch2 OUTPUT ON (12V, 1.3A)", False)
+        self.log_signal.emit("Ch2 OUTPUT ON (12V, 2.0A)", False)
 
-        # ADD YOUR LOGIC HERE
 
-        self.psu_send_command("OUTP OFF")
-        self.stop_voltage_monitoring()
-        self.log_signal.emit("Ch2 OUTPUT OFF (16V step complete)", False)
+    
+    def worker_ch3_5v(self):
+        self.psu_send_command("*CLS")
+        self.psu_send_command("INST:NSEL 3")
+        time.sleep(0.1)
 
+        self.psu_send_command("SOUR3:VOLT 5.0")
+        # self.set_channel_current_with_ocp(3, 1.0)
+
+        self.psu_send_command("OUTP ON")
+        time.sleep(0.5)   # ⏳ let PSU settle
+        self.start_voltage_monitoring()
+        self.current_channel = 3
+        self.log_signal.emit("Ch3 OUTPUT ON (5V, 1.0A)", False)
+
+    def channel_2_off(self):
+        try:
+            self.psu_send_command("INST:NSEL 2")
+            time.sleep(0.5)
+            self.psu_send_command("OUTP OFF")
+            time.sleep(0.5)
+            self.log_signal.emit("Channel 2 turned OFF", False)
+        except Exception as e:
+            self.log_signal.emit(f"Failed to turn off Channel 2: {e}", True)
+            
     def worker_ch2_5v(self):
         self.psu_send_command("*CLS")
         self.psu_send_command("INST:NSEL 2")
         time.sleep(0.1)
 
         self.psu_send_command("SOUR2:VOLT 5.0")
-        self.psu_send_command("SOUR2:CURR 1.3")
+        # self.set_channel_current_with_ocp(2, 2.0)
 
         self.psu_send_command("OUTP ON")
         time.sleep(0.5)   # ⏳ let PSU settle
         self.start_voltage_monitoring()
         self.current_channel = 2
-        self.log_signal.emit("Ch2 OUTPUT ON (5V, 1.3A)", False)
+        self.log_signal.emit("Ch2 OUTPUT ON (5V, 2.0A)", False)
 
-        # ADD YOUR LOGIC HERE
-
-        self.psu_send_command("OUTP OFF")
-        self.stop_voltage_monitoring()
-        self.log_signal.emit("Ch2 OUTPUT OFF (8V step complete)", False)
-        
-    
-    
-    
-    def run_channel_sequence(self, channel: int):
-        print("\n==============================")
-        print(f"ENTER run_channel_sequence(channel={channel})")
-        print("==============================")
-
-        self.debug_active_channel("START")
-
-        self.psu_send_command("*CLS")
-        self.psu_send_command(f"INST:NSEL {channel}")
-        time.sleep(0.1)
-
-        self.debug_active_channel("AFTER INST:NSEL")
-
-        # 🔴 SET VOLTAGE / CURRENT
-        self.psu_send_command(f"SOUR{channel}:VOLT 28.0")
-        self.psu_send_command(f"SOUR{channel}:CURR 1.35")
-
-
-        self.debug_active_channel("AFTER SET V/I")
-
-        # 🔴 OUTPUT ON
-        self.psu_send_command("OUTP ON")
-        time.sleep(0.5)   # ⏳ let PSU settle
-        self.start_voltage_monitoring()
-        time.sleep(0.2)
-
-        self.debug_active_channel("AFTER OUTP ON")
-
-        out_state = self.psu_send_command("OUTP?")
-        print(f"CHANNEL {channel} OUTPUT STATE AFTER ON:", out_state)
-
-        self.current_channel = channel
-        self.log_signal.emit(f"Ch{channel} OUTPUT ON", False)
-
-
-        self.debug_active_channel("BEFORE OUTP OFF")
-
-        self.psu_send_command("*CLS")
-        self.psu_send_command(f"INST:NSEL {channel}")
-        self.psu_send_command("OUTP OFF")
-        self.stop_voltage_monitoring()
-
-        self.debug_active_channel("AFTER OUTP OFF")
-
-        self.log_signal.emit(f"Ch{channel} OUTPUT OFF", False)
-
-
-    
-    
     def select_psu_channel(self, channel: int) -> bool:
         if channel not in [1, 2]:
             self.log_signal.emit(
@@ -1228,62 +1826,154 @@ class FullTestScreen(QMainWindow):
         self.current_value = current
         self.update_voltage_label()
 
+        ch = self.current_channel
+        if ch and ch in self.channel_ocp_limits:
+            limit = self.channel_ocp_limits[ch]
+            if current >= limit and ch not in self._ocp_tripped_channels:
+                self._ocp_tripped_channels.add(ch)
+                self._handle_ocp_trip(ch, current, limit)
+
+    def _handle_ocp_trip(self, channel: int, measured: float, limit: float):
+        self.log_signal.emit(
+            f"❌ OCP TRIP on Ch{channel}: {measured:.2f}A ≥ limit {limit:.2f}A — turning output OFF",
+            True
+        )
+        try:
+            self.turn_off_psu_output(channel)
+        except Exception as e:
+            self.log_signal.emit(f"ERROR: Failed to turn off Ch{channel} after OCP trip - {e}", True)
+
+        self.abort_event.set()
+
+        self._queue_popup(
+            "⚠ High Current Detected",
+            f"Channel {channel} exceeded its safe current limit.\n\n"
+            f"Measured: {measured:.2f} A\n"
+            f"Limit: {limit:.2f} A\n\n"
+            f"Output has been turned OFF automatically.\n"
+            f"Please check wiring/load for a short circuit before continuing.",
+            None,
+            "ok",
+            None,
+        )
+
     def update_voltage_label(self):
         """Update top-right voltage/current label with live readings"""
         channel_str = f"CH{self.current_channel}" if self.current_channel else "PSU"
         self.voltage_label.setText(
             f"Power Supply: {channel_str} → {self.voltage_value:.2f} V | {self.current_value:.2f} A"
         )
-    
-    def show_operator_popup(self, title, message, image_path=None, buttons="ok", timer_seconds=None):
-        if getattr(self, "_disconnect_in_progress", False):
+        # Keep combo in sync when automation changes current_channel
+        if self.current_channel and hasattr(self, "channel_select_combo"):
+            combo_index = self.current_channel - 1
+            if self.channel_select_combo.currentIndex() != combo_index:
+                self.channel_select_combo.blockSignals(True)
+                self.channel_select_combo.setCurrentIndex(combo_index)
+                self.channel_select_combo.blockSignals(False)
+
+    def _on_display_channel_changed(self, index: int):
+        channel = index + 1
+        self.current_channel = channel
+        self.update_voltage_label()
+
+        if not self.psu_inst:
+            self.log_signal.emit(f"Display channel → CH{channel} (PSU not connected yet)", False)
             return
 
-        popup = OperatorInfoPopup(
-            title=title,
-            message=message,
-            image_path=image_path,
-            buttons=buttons,
-            timer_seconds=timer_seconds,
-            parent=self
-        )
+        if (self.voltage_monitor_thread is not None
+                and self.voltage_monitor_thread.isRunning()):
+            self.voltage_monitor_thread.set_channel(channel)   # ← live swap, no restart
+            self.log_signal.emit(f"Display channel switched → CH{channel}", False)
+            return
 
-        def handle_result(result):
-            # 🔥 GET result from popup
-            res, operator = popup.get_result()
+        # fallback: monitor wasn't running, start fresh
+        self.stop_voltage_monitoring()
+        time.sleep(0.1)
+        self.start_voltage_monitoring()
+        self.log_signal.emit(f"Display channel → CH{channel} (monitoring not active)", False)
+    
+    # REPLACE TO:
+    def show_operator_popup(self, title, message, image_path=None,
+                        buttons="ok", timer_seconds=None,
+                        rich_html=False, image_size=420):
+        if getattr(self, "_disconnect_in_progress", False) or self.abort_event.is_set():
+            return
 
-            # store globally for excel
+        def _callback(result, popup):
+            try:
+                res, operator = popup.get_result()
+            except RuntimeError:
+                # Popup's underlying Qt widget was already destroyed
+                # (e.g. force-closed by an Abort that landed mid-popup).
+                self.operator_event.set()
+                return
+
             self.last_test_result = res
             self.last_operator_response = operator
-
-            print("RESULT:", res)
-            print("OPERATOR:", operator)
-
             if buttons == "yes_no":
                 if result == QDialog.Accepted:
-                    # YES → PASS
                     self.operator_event.set()
                 else:
-                    # NO → FAIL but continue test
                     self.log_signal.emit("Operator clicked NO, continuing test...", True)
                     self.operator_event.set()
             else:
-                self.operator_event.set()
+                if getattr(self, "_awaiting_reconnect_ack", False):
+                    self._reconnect_event.set()
+                else:
+                    self.operator_event.set()
 
-        popup.finished.connect(handle_result)
-        popup.show()
+        if rich_html:
+            popup = OperatorInfoPopup(
+                title=title, message=message, image_path=image_path,
+                buttons=buttons, timer_seconds=timer_seconds,
+                rich_html=True, image_size=image_size, parent=self   # ← add image_size
+            )
+            self.active_popup = popup
+            popup.finished.connect(lambda result: _callback(result, popup))
+            popup.setWindowModality(Qt.NonModal)
+            popup.setWindowFlags(popup.windowFlags() | Qt.WindowStaysOnTopHint)
+            popup.show()
+            QApplication.processEvents()
+            return
+
+        self._queue_popup(title, message, image_path, buttons, timer_seconds,
+                        callback=_callback)
+        
     def check_abort(self):
-        """
-        Call this frequently inside long-running processes.
-        Raises Exception to break thread execution instantly.
-        """
         if self.abort_event.is_set():
             raise Exception("TEST_ABORTED_BY_USER")
+        if not self._psu_ready_event.is_set():
+            self.log_signal.emit("⏸ Test paused — waiting for PSU to reconnect...", False)
+            self._psu_ready_event.wait(timeout=300)
+            if self.abort_event.is_set():
+                raise Exception("TEST_ABORTED_BY_USER")
+            self.log_signal.emit("▶ PSU ready — test resuming.", False)
 
 
     # ========================================================================
-    # STEP 3: RUN PSU AUTOMATION SEQUENCE
+    # RUN PSU AUTOMATION SEQUENCE
     # ========================================================================
+    def run_psu_automation_no_jbox(self):
+        try:
+            self._setup_psu_remote()
+            self._power_on_norm()
+            self._connect_norm_relays()
+            self._run_norm_tests()
+            self._operator_gate_stby()
+            self._setup_stby_switches()
+            self._power_on_norm()
+            self._connect_stby_relays()
+            self._run_stby_tests()
+            self._teardown_no_jb()
+        except Exception as e:
+            import traceback
+            err_str = str(e)
+            full_trace = traceback.format_exc()
+            print(f"[FULL TRACEBACK]\n{full_trace}")
+            if "TEST_ABORTED_BY_USER" in err_str:
+                self.log_signal.emit("Test aborted cleanly.", False)
+            elif not getattr(self, "_psu_error_handled", False):
+                self.log_signal.emit(f"ERROR: PSU automation failed - {err_str}", True)
     def run_psu_automation(self):
         """
         Router:
@@ -1293,8 +1983,7 @@ class FullTestScreen(QMainWindow):
         if self.is_junction_box_mode():
             return self.run_psu_automation_with_jbox()
         return self.run_psu_automation_no_jbox()
-    
-    
+
     def run_psu_automation_with_jbox(self):
         try:
             self.check_abort()
@@ -1303,385 +1992,299 @@ class FullTestScreen(QMainWindow):
             time.sleep(1)
             self.start_device_monitoring()
             self.check_abort()
-            jb_seq.run_norm(self)
-            time.sleep(0.5)
-            jb_seq.run_stby(self)
+
+            jb_seq.run_norm(self)   # already imported at top of full_test_screen.py
+
+            remove_apx_recovery_hooks()
+            remove_relay_hooks()
             time.sleep(0.5)
             self.log_signal.emit("========== ALL JUNCTION BOX TESTS COMPLETED ==========", False)
-            QTimer.singleShot(500, self.show_test_completion)
+            self.completion_signal.emit()
 
         except Exception as e:
-            self.log_signal.emit(f"ERROR: Junction Box PSU automation failed - {str(e)}", True)
+            err_str = str(e)
+            if "TEST_ABORTED_BY_USER" not in err_str and "PSU communication" not in err_str:
+                self.log_signal.emit(f"ERROR: Junction Box PSU automation failed - {err_str}", True)
+    # ── Stage 1 ───────────────────────────────────────────────────────────────────
 
-    def run_psu_automation_no_jbox(self):
-        try:
-            
-            if not self.psu_inst:
-                self.psu_inst = self.find_psu()
+    def _setup_psu_remote(self):
+        self.test_running = True
+        self._safe_set_remote()
+        time.sleep(0.2)
+        self.psu_send_command("INST:NSEL 1")
+        time.sleep(0.1)
+        self.freeze_psu_front_panel()
+        time.sleep(0.2)
+        self.start_device_monitoring()
 
-            if not self.psu_inst:
-                self.log_signal.emit("ERROR: PSU not found", True)
-                return
-            self.test_running = True
-            # 🔑 Enter REMOTE mode ONCE
-            self.psu_send_command("SYST:REM")
-            time.sleep(0.2)
+    # ── Stage 2 ───────────────────────────────────────────────────────────────────
 
-            # 🔥 HARD RE-BIND CHANNEL CONTEXT (CRITICAL)
-            self.psu_send_command("INST:NSEL 1")
-            time.sleep(0.1)
+    def _power_on_norm(self):
+        self.worker_channel_1()
+        time.sleep(2)
 
-            # 🔒 Lock front panel AFTER setup
-            self.freeze_psu_front_panel()
-            time.sleep(0.2)
+    # ── Stage 3 ───────────────────────────────────────────────────────────────────
 
-            # 🔑 RE-ENTER REMOTE MODE (CRITICAL FIX)
-            self.psu_send_command("SYST:REM")
-            time.sleep(0.2)
+    def _connect_norm_relays(self):
+        # 🛑 PAUSE POINT
+        self.check_abort()
+        self.operator_event.clear()
+        self.show_popup_signal.emit(
+            "⚠ Operator Action Required",
+            "• Set STBY/NORMAL switch to NORMAL.\n",
+            RESOURCES_DIR / "normal.jpeg","ok",None
+        )
 
-            # 🔁 Force starting channel to CH1
-            self.psu_send_command("INST:NSEL 1")
-            time.sleep(0.1)
+        # ⏸ WAIT until operator clicks OK
+        self.operator_event.wait()
+        time.sleep(0.5)
+        self.check_abort()
+        self.log_signal.emit(
+            "Connecting audio analyser input mic controller (J13) and phones connector (J15)", False
+        )
+        QApplication.processEvents()
 
+        if STM32RelayController.send_with_retry(STM32RelayController.set_j13_on):
+            self.log_signal.emit("J13 successfully connected", False);  time.sleep(0.5)
+            if STM32RelayController.send_with_retry(STM32RelayController.set_j15_on):
+                self.log_signal.emit("J15 successfully connected", False); time.sleep(0.5)
+            else:
+                self.log_signal.emit("ERROR: Failed to connect J15", True)
+        else:
+            self.log_signal.emit("ERROR: Failed to connect J13/J15", True)
 
+        QApplication.processEvents(); time.sleep(0.5)
+        self.check_abort()
 
-            # ▶ CHANNEL 1 SEQUENCE
-            self.worker_channel_1()
-            time.sleep(2)
+        self.log_signal.emit("Connecting audio analyser generator output (J27)", False)
+        QApplication.processEvents()
 
-            # # ▶ CHANNEL 2 SEQUENCE – STEP 1
-            # self.worker_ch2_28v()
-            # time.sleep(1)
+        if STM32RelayController.send_with_retry(STM32RelayController.set_j27_on):
+            self.log_signal.emit("J27 successfully connected", False); time.sleep(0.5)
+        else:
+            self.log_signal.emit("ERROR: Failed to connect J27", True)
 
-            # # ▶ CHANNEL 2 SEQUENCE – STEP 2
-            # self.worker_ch2_12v()
-            # time.sleep(1)
+        QApplication.processEvents(); time.sleep(0.5)
+        self.check_abort()
 
-            # # ▶ CHANNEL 2 SEQUENCE – STEP 3
-            # self.worker_ch2_5v()
-            # time.sleep(1)
+        generator_control(self, level="750.0 uVrms", frequency=1000)
 
-            # 🔓 Unlock PSU
-            # self.unfreeze_psu_front_panel()
-            # time.sleep(0.3)
+        self.log_signal.emit("Setting Switch S24 (NORM) to UP position", False)
+        QApplication.processEvents()
 
+        if STM32RelayController.send_with_retry(STM32RelayController.set_s24_on):
+            self.log_signal.emit("S24 successfully set to UP position", False); time.sleep(0.5)
+        else:
+            self.log_signal.emit("ERROR: Failed to set S24 to UP position", True)
 
-            #ggs
+        QApplication.processEvents(); time.sleep(0.5)
+        self.check_abort()
+        
+        
+        self.log_signal.emit("INITIALIZATION COMPLETE", False)
+
+    # ── Stage 4 ───────────────────────────────────────────────────────────────────
+
+    def _run_norm_tests(self):
+        self.check_abort()
+        microphone_audio.run_norm(self);       time.sleep(0.5); self.check_abort()
+        phones_audio.run(self);                time.sleep(0.5); self.check_abort()
+        mic_limiter.run(self);                 time.sleep(0.5); self.check_abort()
+        vos_delay.run_norm(self);              time.sleep(0.5); self.check_abort()
+        voltage_measurement.run_norm(self);    time.sleep(0.5); self.check_abort()
+        resistance_measurement.run_norm(self); time.sleep(0.5); self.check_abort()
+        transient.run(self);                   time.sleep(0.5); self.check_abort()
+        lighting_test.run_norm(self);          time.sleep(0.5); self.check_abort()
+        self.log_signal.emit("==========All TESTS COMPLETED IN NORMAL MODE==========", False)
+        time.sleep(2)
+
+    # ── Stage 5 ───────────────────────────────────────────────────────────────────
+
+    def _operator_gate_stby(self):
+        self.operator_event.clear()
+
+        # AFTER
+        from dialogs.calibration_popup import MODEL_IMAGES  # already imported at top — add if missing
+
+        _model_img = MODEL_IMAGES.get(self.alhx_combo.currentText().strip(), "sb.png")
+        self.check_abort()
+        self.show_popup_signal.emit(
+            "⚠ Operator Setup Required",
+            "• Turn the ICS knobs fully CW.\n"
+            "• Set MIC Mode to HOT.\n"
+            "• Turn TX SEL knobs fully CCW and to the OUT position.\n"
+            "• Turn RX SEL knobs fully CCW.\n"
+            "• Set STBY/NORM switch to NORM position.",
+            RESOURCES_DIR / _model_img,
+            "acknowledge",
+            None,
+        )
+        self.operator_event.wait()
+        time.sleep(2)
+
+        self.log_signal.emit("========== INITIALIZATION START ==========", False)
+        time.sleep(1)
+        self.log_signal.emit("Switching all relays to default state", False)
+        QApplication.processEvents()
+        if STM32RelayController.send_with_retry(STM32RelayController.set_default_states):
+            self.log_signal.emit("All relays successfully set to default states", False)
+        else:
+            self.log_signal.emit("ERROR: Failed to set relays to default states", True)
+
+        self.log_signal.emit("COMMENCING TESTS UNDER STBY MODE", False)
+
+    # ── Stage 6 ───────────────────────────────────────────────────────────────────
+
+    def _setup_stby_switches(self):
+        steps = [
+            ("LOCAL/REMOTE (S23) → LOCAL",
+            STM32RelayController.set_s23_local, "S23 set to LOCAL"),
+            ("LOAD (S31) → 600 OHM",
+            STM32RelayController.set_s31_600ohm, "S31 set to 600 OHM"),
+        ]
+        for msg, cmd, ok_msg in steps:
+            self.log_signal.emit(msg, False)
+            QApplication.processEvents()
+            if STM32RelayController.send_with_retry(cmd):
+                self.log_signal.emit(ok_msg, False)
+            else:
+                self.log_signal.emit(f"ERROR: Failed — {msg}", True)
+            QApplication.processEvents(); time.sleep(0.5)
             self.check_abort()
-            
 
-            self.log_signal.emit("Step 8: Connecting the audio analyser input mic controller (J13) and phones connector (J15) ", False)
-            QApplication.processEvents()   # 🔑 FORCE UI UPDATE
+        for placeholder in [
+            "Connecting power supply connector (J58)",
+            "Connecting power supply connector (J60)",
+            "Power Supply set to 28V",
+        ]:
+            self.log_signal.emit(placeholder, False)
+            time.sleep(0.5)
+            self.check_abort()
 
-            if STM32RelayController.set_j13_on():
-                self.log_signal.emit("J13 successfully set to ON", False)
-                time.sleep(0.5)
-                if STM32RelayController.set_j15_on():
-                    self.log_signal.emit("J15 successfully set to ON", False)
-                    time.sleep(0.5)
-                else:
-                    self.log_signal.emit("ERROR: Failed to set J15 to ON", True)
-                    return
+        self.log_signal.emit("Live voltage monitoring enabled", False)
+        self.log_signal.emit("========== PSU AUTOMATION STARTING ==========", False)
+        time.sleep(1)
+        self.check_abort()
+
+    # ── Stage 7 ───────────────────────────────────────────────────────────────────
+
+    def _connect_stby_relays(self):
+        self.check_abort()
+        self.log_signal.emit(
+            "Connecting audio analyser input mic controller (J13) and phones connector (J15)", False
+        )
+        QApplication.processEvents()
+
+        if STM32RelayController.send_with_retry(STM32RelayController.set_j13_on):
+            self.log_signal.emit("J13 Connected successfully", False); time.sleep(0.5)
+            if STM32RelayController.send_with_retry(STM32RelayController.set_j15_on):
+                self.log_signal.emit("J15 Connected successfully", False); time.sleep(0.5)
+            else:
+                self.log_signal.emit("ERROR: Failed to connect J15", True)
+        else:
+            self.log_signal.emit("ERROR: Failed to connect J13/J15", True)
+
+        QApplication.processEvents(); time.sleep(0.5)
+        self.check_abort()
+
+        if STM32RelayController.send_with_retry(STM32RelayController.set_s35_on):
+            self.log_signal.emit("S35/SB sel successfully set to UP position", False); time.sleep(0.5)
+        else:
+            self.log_signal.emit("ERROR: Failed to set S35/SB sel to UP position", True)
+
+        time.sleep(0.5)
+        self.check_abort()
+
+        generator_control(self, level="750.0 uVrms", frequency=1000)
+
+        self.log_signal.emit("Connecting audio analyser generator output (J27)", False)
+        QApplication.processEvents()
+
+        if STM32RelayController.send_with_retry(STM32RelayController.set_j27_on):
+            self.log_signal.emit("J27 Connected successfully", False); time.sleep(0.5)
+        else:
+            self.log_signal.emit("ERROR: Failed to connect J27", True)
+
+        QApplication.processEvents(); time.sleep(0.5)
+        self.check_abort()
+
+        self.log_signal.emit("Setting Switch S24 (NORM) to OFF", False)
+        QApplication.processEvents()
+        if STM32RelayController.send_with_retry(STM32RelayController.set_s24_off):
+            self.log_signal.emit("S24 successfully set to DOWN position", False); time.sleep(0.5)
+        else:
+            self.log_signal.emit("ERROR: Failed to set S24 to DOWN position", True)
+
+        QApplication.processEvents(); time.sleep(0.5)
+        self.check_abort()
+
+        self.log_signal.emit("Setting Switch S25 (STBY) to UP position", False)
+        QApplication.processEvents()
+        if STM32RelayController.send_with_retry(STM32RelayController.set_s25_on):
+            self.log_signal.emit("S25 successfully set to UP position", False); time.sleep(0.5)
+        else:
+            self.log_signal.emit("ERROR: Failed to set S25 to UP position", True)
+
+        QApplication.processEvents(); time.sleep(0.5)
+        self.check_abort()
+        
+        # 🛑 PAUSE POINT
+        self.operator_event.clear()
+        self.show_popup_signal.emit(
+            "⚠ Operator Action Required",
+            "• DS12 and DS13 indicators should illuminate red.\n",
+            RESOURCES_DIR / "ds_12_13.jpeg","yes_no",None
+        )
+
+        # ⏸ WAIT until operator clicks OK
+        self.operator_event.wait()
+        time.sleep(0.5)
+        self.log_signal.emit("INITIALIZATION COMPLETE", False)
+
+    # ── Stage 8 ───────────────────────────────────────────────────────────────────
+
+    def _run_stby_tests(self):
+        self.check_abort()
+        microphone_audio.run_stby(self);       time.sleep(0.5); self.check_abort()
+        # to STATION BOX PH Connector (J29) ──
+        self.log_signal.emit("connecting Audio analyser input to STATION BOX PH Connector (J29)", False)
+        QApplication.processEvents()
+
+        if STM32RelayController.send_with_retry(STM32RelayController.set_j29_on):
+            self.log_signal.emit("STATION BOX PH Connector J29 successfully connected", False)
+            time.sleep(0.5)
+        else:
+            self.log_signal.emit("ERROR: Failed to connect Audio analyser input to STATION BOX PH Connector J29", True)
+        self.check_abort()
+        vos_delay.run_stby(self);              time.sleep(0.5); self.check_abort()
+        voltage_measurement.run_stby(self);    time.sleep(0.5); self.check_abort()
+        resistance_measurement.run_stby(self); time.sleep(0.5); self.check_abort()
+        lighting_test.run_stby(self);          time.sleep(0.5); self.check_abort()
+        self.log_signal.emit("==========All TESTS COMPLETED IN STBY MODE==========", False)
+        time.sleep(2)
+
+    # ── Stage 9 ───────────────────────────────────────────────────────────────────
+
+    def _teardown_no_jb(self):
+        self.check_abort()
+        self.log_signal.emit("Switching all relays to default state", False)
+        QApplication.processEvents()
+        if STM32RelayController.send_with_retry(STM32RelayController.set_default_states):
+            self.log_signal.emit("All relays successfully set to default states", False)
+        else:
+            self.log_signal.emit("ERROR: Failed to set relays to default states", True)
+
+        time.sleep(2)
+        self.check_abort()
+
+        self.log_signal.emit("Ch1 OUTPUT OFF", False)
+        self.log_signal.emit("✓ PSU automation COMPLETED", False)
+        remove_apx_recovery_hooks()
+        remove_relay_hooks()
+        self.unfreeze_psu_front_panel()
+        time.sleep(0.3)
+        self.completion_signal.emit()
                 
-            else:
-                self.log_signal.emit("ERROR: Failed to set J13 and/or J15 to ON", True)
-                return
-
-            QApplication.processEvents()
-            time.sleep(0.5)
-            self.check_abort()
-            
-            
-            self.log_signal.emit("Step 9: Connecting the audio analyser generator output with Connector (J27) ", False)
-            QApplication.processEvents()   # 🔑 FORCE UI UPDATE
-
-            if STM32RelayController.set_j27_on():
-                self.log_signal.emit("J27 successfully set to ON", False)
-                time.sleep(0.5)
-                
-            else:
-                self.log_signal.emit("ERROR: Failed to  J27 to ON", True)
-                return
-
-            QApplication.processEvents()
-            time.sleep(0.5)
-            self.check_abort()
-
-            configure_apx(self)
-            generator_control(self, level="750.0 uVrms", frequency=1000,state="on")
-
-            self.log_signal.emit("Step 10: Setting Switch (S24) NORM to ON.  ", False)
-            QApplication.processEvents()   # 🔑 FORCE UI UPDATE
-
-            if STM32RelayController.set_s24_on():
-                self.log_signal.emit("S24 successfully set to ON", False)
-                time.sleep(0.5)
-                
-            else:
-                self.log_signal.emit("ERROR: Failed to  S24 to ON", True)
-                return
-
-            QApplication.processEvents()
-            time.sleep(0.5)
-            self.check_abort()
-            
-            
-            self.log_signal.emit("INITIALIZATION COMPLETE", False)
-            
-            microphone_audio.run_norm(self)
-            time.sleep(0.5)
-            self.check_abort()
-            phones_audio.run(self)
-            time.sleep(0.5)
-            self.check_abort()
-            mic_limiter.run(self)
-            time.sleep(0.5)
-            self.check_abort()
-            vos_delay.run_norm(self)
-            time.sleep(0.5)
-            self.check_abort()
-            voltage_measurement.run_norm(self)
-            time.sleep(0.5)
-            self.check_abort()
-            resistance_measurement.run_norm(self)
-            time.sleep(0.5)
-            transient.run(self)
-            time.sleep(0.5)
-            self.check_abort()
-            lighting_test.run_norm(self)
-            time.sleep(0.5)
-            self.check_abort()
-            self.log_signal.emit("==========All TESTS COMPLETED IN NORMAL MODE==========", False)
-            time.sleep(2)
-
-
-
-            # 🛑 PAUSE POINT – Operator Setup Instructions
-            self.operator_event.clear()
-
-            self.show_popup_signal.emit(
-                "⚠ Operator Setup Required",
-                "• Connect cables J65 to J101 and J66 to J102.\n"
-                "• Turn the ICS knobs fully CW.\n"
-                "• Set MIC Mode to HOT.\n"
-                "• Turn TX SEL knobs fully CCW and to the OUT position.\n"
-                "• Turn RX SEL knobs fully CCW.\n"
-                "• Set STBY/NORM switch to NORM position.",
-                RESOURCES_DIR / "knob.png",  # optional image
-                "ok",
-                None
-            )
-
-            # ⏸ Wait for operator confirmation
-            self.operator_event.wait()
-
-            time.sleep(2)
-
-            self.log_signal.emit("========== INITIALIZATION START ==========", False)
-            time.sleep(1)
-            self.log_signal.emit("Switching all Relays to Default state", False)
-            QApplication.processEvents()   # 🔑 FORCE UI UPDATE
-
-            if STM32RelayController.set_default_states():
-                self.log_signal.emit("All relays successfully set to default states", False)
-            else:
-                self.log_signal.emit("ERROR: Failed to set all relays to default states", True)
-                return
-
-            # ✅ Do not freeze GUI during settle delay
-            self.log_signal.emit("Waiting 20 seconds for relays to settle...", False)
-
-            self.abortable_sleep(20)
-
-            self.log_signal.emit("COMMENCING TESTS UNDER STBY MODE", False)
-            
-            self.log_signal.emit("Step 1: LOCAL/REMOTE (S23) → LOCAL", False)
-            QApplication.processEvents()   # 🔑 FORCE UI UPDATE
-
-            if STM32RelayController.set_s23_local():
-                self.log_signal.emit("S23 successfully set to LOCAL", False)
-            else:
-                self.log_signal.emit("ERROR: Failed to set S23 to LOCAL", True)
-                return
-
-            QApplication.processEvents()
-            time.sleep(0.5)
-            self.check_abort()
-            
-            self.log_signal.emit("Step 2: LOAD (S31) → 600 OHM", False)
-            QApplication.processEvents()   # 🔑 FORCE UI UPDATE
-
-            if STM32RelayController.set_s31_600ohm():
-                self.log_signal.emit("S31 successfully set to 600 OHM", False)
-            else:
-                self.log_signal.emit("ERROR: Failed to set S31 to 600 OHM", True)
-                return
-
-            QApplication.processEvents()
-            time.sleep(0.5)
-            self.check_abort()
-
-            
-            self.log_signal.emit("Step 3: All switches DOWN", False)
-            self.logger.log("# WRITE SWITCH CONTROL LOGIC HERE", False)
-            time.sleep(0.5)
-            self.check_abort()
-            
-            self.log_signal.emit("Step 4: Connecting the power supply connector (J58)", False)
-            QApplication.processEvents()   # 🔑 FORCE UI UPDATE
-
-            if STM32RelayController.set_j58_on():
-                self.log_signal.emit("J58 successfully set to ON", False)
-            else:
-                self.log_signal.emit("ERROR: Failed to set J58 to ON", True)
-                return
-
-            QApplication.processEvents()
-            time.sleep(0.5)
-            self.check_abort()
-            
-            self.log_signal.emit("Step 5: Connecting the power supply connector (J60)", False)
-            QApplication.processEvents()   # 🔑 FORCE UI UPDATE
-
-            if STM32RelayController.set_j60_on():
-                self.log_signal.emit("J60 successfully set to ON", False)
-            else:
-                self.log_signal.emit("ERROR: Failed to set J60 to ON", True)
-                return
-
-            QApplication.processEvents()
-            time.sleep(0.5)
-            self.check_abort()
-            
-            self.log_signal.emit("Step 6: Power Supply set to 28V (SOUR:VOLT 28.0)", False)
-            self.logger.log("# WRITE SCPI LOGIC HERE", False)
-            time.sleep(0.5)
-            self.check_abort()
-            self.worker_channel_1()
-            
-            self.log_signal.emit("Step 7: Live voltage monitoring enabled", False)
-
-            self.log_signal.emit("========== PSU AUTOMATION STARTING ==========", False)
-            time.sleep(1)
-            self.check_abort()
-            self.log_signal.emit("Step 8: Connecting the audio analyser input mic controller (J13) and phones connector (J15) ", False)
-            QApplication.processEvents()   # 🔑 FORCE UI UPDATE
-
-            if STM32RelayController.set_j13_on():
-                self.log_signal.emit("J13 successfully set to ON", False)
-                time.sleep(0.5)
-                if STM32RelayController.set_j15_on():
-                    self.log_signal.emit("J15 successfully set to ON", False)
-                    time.sleep(0.5)
-                else:
-                    self.log_signal.emit("ERROR: Failed to set J15 to ON", True)
-                    return
-                
-            else:
-                self.log_signal.emit("ERROR: Failed to set J13 and/or J15 to ON", True)
-                return
-
-            QApplication.processEvents()
-            time.sleep(0.5)
-            self.check_abort()
-            
-            
-            self.log_signal.emit("Step 9: Connecting the audio analyser generator output with connector (J27) ", False)
-            QApplication.processEvents()   # 🔑 FORCE UI UPDATE
-
-            if STM32RelayController.set_j27_on():
-                self.log_signal.emit("J27 successfully set to ON", False)
-                time.sleep(0.5)
-                
-            else:
-                self.log_signal.emit("ERROR: Failed to  J27 to ON", True)
-                return
-
-            QApplication.processEvents()
-            time.sleep(0.5)
-            self.check_abort()
-            
-            
-            
-            
-            self.log_signal.emit("Step 10: Setting Switch (S24) NORM to ON.  ", False)
-            QApplication.processEvents()   # 🔑 FORCE UI UPDATE
-
-            if STM32RelayController.set_s24_on():
-                self.log_signal.emit("S24 successfully set to ON", False)
-                time.sleep(0.5)
-                
-            else:
-                self.log_signal.emit("ERROR: Failed to  S24 to ON", True)
-                return
-
-            QApplication.processEvents()
-            time.sleep(0.5)
-            self.check_abort()
-            
-            
-            
-            
-            self.log_signal.emit("Step 11: Setting Switch (S25) STBY to ON.  ", False)
-            QApplication.processEvents()   # 🔑 FORCE UI UPDATE
-
-            if STM32RelayController.set_s25_on():
-                self.log_signal.emit("S25 successfully set to ON", False)
-                time.sleep(0.5)
-                
-            else:
-                self.log_signal.emit("ERROR: Failed to  S25 to ON", True)
-                return
-
-            QApplication.processEvents()
-            time.sleep(0.5)
-            self.check_abort()
-            self.log_signal.emit("Step 12: Setting Switch (S24) NORM to OFF.  ", False)
-            QApplication.processEvents()   # 🔑 FORCE UI UPDATE
-
-            if STM32RelayController.set_s24_off():
-                self.log_signal.emit("S24 successfully set to OFF", False)
-                time.sleep(0.5)
-                
-            else:
-                self.log_signal.emit("ERROR: Failed to  S24 to OFF", True)
-                return
-
-            QApplication.processEvents()
-            time.sleep(0.5)
-            self.check_abort()
-            self.log_signal.emit("INITIALIZATION COMPLETE", False)
-            self.check_abort()
-            microphone_audio.run_stby(self)
-            time.sleep(0.5)
-            self.check_abort()
-            vos_delay.run_stby(self)
-            time.sleep(0.5)
-            self.check_abort()
-            voltage_measurement.run_stby(self)
-            time.sleep(0.5)
-            self.check_abort() 
-            resistance_measurement.run_stby(self)
-            time.sleep(0.5)
-            self.check_abort()
-            lighting_test.run_stby(self)
-            time.sleep(0.5)
-            self.check_abort()
-            
-            self.log_signal.emit("==========All TESTS COMPLETED IN STBY MODE==========", False)
-            time.sleep(2)
-            self.check_abort()
-            self.log_signal.emit("Ch1 OUTPUT OFF", False)
-            self.log_signal.emit("✓ PSU automation COMPLETED", False)
-            # 🔓 Unlock PSU
-            self.unfreeze_psu_front_panel()
-            time.sleep(0.3)
-            QTimer.singleShot(500, self.show_test_completion)
-
-            
-
-        except Exception as e:
-            self.log_signal.emit(f"ERROR: PSU automation failed - {str(e)}", True)
     def abortable_sleep(self, seconds: float, step: float = 0.1):
         """
         Sleep in small chunks so Abort works instantly.
@@ -1690,25 +2293,79 @@ class FullTestScreen(QMainWindow):
         while time.time() < end_time:
             self.check_abort()
             time.sleep(step)
-
+    
     # ========================================================================
     # EXISTING METHODS (REFINED)
     # ========================================================================
+    def showEvent(self, event):
+        super().showEvent(event)
+        for listener in getattr(self, "device_listeners", []):
+            try:
+                listener.resume()
+            except Exception:
+                pass
+
+    def _cleanup_session(self, reset_relays: bool = False):
+        """
+        Full, synchronous teardown of everything this screen's session owns.
+        Call this instead of abort_test_internal() directly whenever the user
+        is navigating away (Back button) — abort_test_internal() alone leaves
+        psu_thread/init_thread running and never releases the VISA handles,
+        which is what causes the next screen's PSU/DMM/scope discovery to
+        hang on a resource this screen never let go of.
+        """
+        self.abort_event.set()
+        self._psu_shutdown_in_progress = True
+        self._reconnect_generation += 1
+        self.operator_event.set()
+        self._psu_ready_event.set()
+        self._force_close_all_dialogs()
+
+        self._stop_worker_thread(self.psu_thread, "Test thread")
+        self._stop_worker_thread(self.init_thread, "Init thread")
+
+        self.abort_test_internal(reset_relays=reset_relays)
+
+        for listener in getattr(self, "device_listeners", []):
+            try:
+                listener.stop()
+                listener.wait(1500)
+            except Exception:
+                pass
+        self.device_listeners = []
+
+        try:
+            if self.psu_inst:
+                with self.psu_lock:
+                    self.psu_inst.close()
+        except Exception:
+            pass
+        self.psu_inst = None
+
+        try:
+            if self.rm:
+                self.rm.close()
+        except Exception:
+            pass
+        self.rm = None
+
+        try:
+            self.stop_voltage_monitoring()
+        except Exception:
+            pass
+
     def on_back_clicked(self):
-        """
-        Handle Back button click.
-        If test is running, show abort confirmation; otherwise return immediately.
-        """
         if self.test_running:
-            # Show abort confirmation dialog
             confirmation = AbortTestConfirmationPopup(self)
             if confirmation.exec_() == QDialog.Accepted:
-                # User confirmed abort
-                self.abort_test_internal()
+                self._cleanup_session(reset_relays=False)
                 self.return_to_test_selection.emit()
-            # else: User clicked Cancel, stay on screen
         else:
-            # No test running – immediately return
+            for listener in getattr(self, "device_listeners", []):
+                try:
+                    listener.pause()
+                except Exception:
+                    pass
             self.return_to_test_selection.emit()
 
     def on_jbox_selection_changed(self, text):
@@ -1725,20 +2382,20 @@ class FullTestScreen(QMainWindow):
         # =====================================================
         # 🔴 IF JUNCTION BOX = ALH4 → ONLY ALH2 SUPPORTED
         # =====================================================
-        if text.strip().upper() == "ALH4":
+        if text.strip().upper() == "N200 - ALH4":
 
             # disable all except ALH2
             for i in range(self.alhx_combo.count()):
                 item_text = self.alhx_combo.itemText(i)
 
-                if item_text == "ALH2":
+                if item_text == "N200 - ALH2":
                     self.alhx_combo.model().item(i).setEnabled(True)
                 else:
                     self.alhx_combo.model().item(i).setEnabled(False)
 
             # auto-switch to ALH2 if something else selected
-            if self.alhx_combo.currentText() != "ALH2":
-                self.alhx_combo.setCurrentText("ALH2")
+            if self.alhx_combo.currentText() != "N200 - ALH2":
+                self.alhx_combo.setCurrentText("N200 - ALH2")
 
         else:
             # =====================================================
@@ -1792,22 +2449,207 @@ class FullTestScreen(QMainWindow):
         Start test after validation.
         Shows calibration dialog ONLY when No Junction Box / normal mode.
         """
+        # ── Guard: ignore duplicate clicks while a test is already running ──
+        if self.test_running:
+            return
+
+        # ── Guard 2: configuration must be locked before anything else ──
+        if not self.config_locked:
+            self.check_abort()
+            self.show_popup_signal.emit(
+                "Configuration Not Locked",
+                "Please fill in all fields and click  'Lock On'  before starting the test.",
+                None,
+                "ok",
+                None,
+            )
+            return
         # Validate control panel
         if not self.validate_control_panel():
             return
-        # Disable lock button once test starts
+        self.log_signal.emit("Connecting with peripheral devices...", False)
+        QApplication.processEvents()
+
+        # AFTER:
+        self._disconnect_done = False
+        self._psu_error_handled = False
+        self._disconnect_in_progress = False
+        self._reconnect_in_progress = False
+        self._disconnect_in_progress_psu = False
+        self._psu_shutdown_in_progress = False
+        self._reconnect_generation += 1
+        self.voltage_stop_event.clear()
+        self.overall_test_passed = True
+        self.abort_event.clear()
+        self.operator_event.clear()
+        self._psu_ready_event.set()
+        self._reconnect_event.clear()
+        self.channel_ocp_limits.clear()
+        self._ocp_tripped_channels.clear()
+        RelayStateTracker.clear()
+
+        # ── Register this screen for the relay wrappers, clear stale state ──
+        self._relay_error_active = False
+        self._skip_relay_reset_on_abort = False
+        STM32RelayController.register_screen(self)
+        STM32RelayController.reset_relay_error_state()
+
+        # ── Fully stop (not just pause) listeners before we close their handles —
+        # pause() only sets a flag and doesn't wait for an in-flight query to
+        # finish, so closing psu_inst right after pause() can race a query
+        # still executing on the listener thread. That race is a native VISA
+        # driver call from two threads at once, which can crash the whole
+        # process rather than raise a catchable Python exception.
+        for listener in getattr(self, "device_listeners", []):
+            try:
+                listener.stop()
+                listener.wait(1500)
+            except Exception:
+                pass
+        self.device_listeners = []
+
+        # ── Stop voltage monitor from previous run ──────────────────────
+        try:
+            self.stop_voltage_monitoring()
+        except Exception:
+            pass
+
+        # ── Always close stale PSU handle and re-open fresh each run ──
+        try:
+            if self.psu_inst:
+                try:
+                    with self.psu_lock:
+                        self.psu_inst.close()
+                except Exception:
+                    pass
+                self.psu_inst = None
+            # Reuse the existing ResourceManager if we already have one — only
+            # create a new one if this is truly the first run (self.rm is None).
+            # Closing and recreating rm here was invalidating osc_conn's separate
+            # session on this VISA backend.
+            import pyvisa as _pyvisa
+            if self.rm is None:
+                self.rm = _pyvisa.ResourceManager()
+            self.psu_inst = self.find_psu()
+            if self.psu_inst:
+                print("[PSU] Fresh PSU handle opened at test start")
+            else:
+                print("[PSU] PSU not found at test start — will retry in init")
+        except Exception as _fe:
+            print(f"[PSU] PSU re-open at test start failed: {_fe}")
+        # ── Force DMM reconnect fresh each run ──────────────────────────
+        try:
+            from core import dmm_reader
+            dmm_reader.reset_dmm()
+            print("[DMM] DMM handle reset — will reconnect fresh on first use")
+        except Exception as _de:
+            print(f"[DMM] DMM reset skipped (non-fatal): {_de}")
+        try:
+            if not dmm_reader.ensure_dmm_connected(self):
+                self.log_signal.emit("DMM connection aborted by user.", True)
+                return
+        except Exception as _de:
+            print(f"[DMM] ensure_dmm_connected failed: {_de}")
+            
+                # ── Force oscilloscope reconnect fresh each run ──────────────────
+        try:
+            from devices.oscilloscope_connection import OscilloscopeConnection
+            from core.oscilloscope_helper import _get_active_non_osc_resources 
+            if getattr(self, "osc_conn", None):
+                try:
+                    # close_instrument_only(), not close(): PSU/DMM are
+                    # already open by this point in start_test() — closing
+                    # the old scope's ResourceManager can invalidate their
+                    # sessions on this VISA backend.
+                    self.osc_conn.close_instrument_only()
+                except Exception:
+                    pass
+            self.osc_conn = OscilloscopeConnection()
+            self.osc_conn.claimed_visa_resources = _get_active_non_osc_resources(self)
+            if self.osc_conn.discover_and_connect():
+                ident = self.osc_conn.get_identification()
+                print(f"[SCOPE] Fresh oscilloscope handle opened: {ident.manufacturer} {ident.model}")
+            else:
+                print("[SCOPE] Oscilloscope not found at test start — autoset will skip later")
+        except Exception as _oe:
+            print(f"[SCOPE] Oscilloscope reconnect failed (non-fatal): {_oe}")
+        if self.psu_inst:
+            try:
+                with self.psu_lock:
+                    self.psu_inst.write("*CLS")
+                    time.sleep(0.2)
+                    self.psu_inst.write("SYST:REM")
+                    time.sleep(0.2)
+                    self.psu_inst.write("*CLS")
+                    time.sleep(0.2)
+
+                    # Turn OFF all channels once before enabling CH3
+                    for ch in (1, 2, 3):
+                        self.psu_inst.write(f"INST:NSEL {ch}")
+                        time.sleep(0.05)
+                        self.psu_inst.write("OUTP OFF")
+                        time.sleep(0.1)
+
+                    self.psu_inst.write("INST:NSEL 3")
+                    time.sleep(0.05)
+                    self.psu_inst.write("SOUR3:VOLT 5.0"); time.sleep(0.5)
+                    self.psu_inst.write("SOUR3:CURR 1.0"); time.sleep(0.5)
+                    self.psu_inst.write("OUTP ON"); time.sleep(0.5)
+                    time.sleep(0.3)
+            except Exception as _pe:
+                print(f"[PSU] CH3 pre-power failed (non-fatal): {_pe}")
+        # ── PSU handle is now stable — update listener reference and resume ──
+        for listener in getattr(self, "device_listeners", []):
+            try:
+                if isinstance(listener, PSUListener):
+                    listener.psu_inst = self.psu_inst   # point to fresh handle
+                    listener.fail_count = 0             # reset stale fail counter
+                listener.resume()
+            except Exception:
+                pass
+
+        try:
+            sync_ok = STM32RelayController.send_with_retry(STM32RelayController.sync)
+            if sync_ok:
+                print("[STM32] Sync confirmed at test start")
+            else:
+                print("[STM32] Sync sent — no response (already synced or benign)")
+        except Exception as _se:
+            print(f"[STM32] Sync skipped at test start: {_se}")
+            
+            
+        # ── Rename log file to reflect mode, model, and time ──────────────
+        _log_time = datetime.now().strftime("%d%m%Y_%H%M%S")
+        if self.is_junction_box_mode():
+            _jbox_model = (
+                self.jbox_combo.currentText().strip()
+                    .replace("N200 - ", "N200-")
+                    .replace(" ", "-")
+            )
+            _log_name = f"FT_JNBX_{_jbox_model}_{_log_time}.log"
+        else:
+            _stbx_model = (
+                self.alhx_combo.currentText().strip()
+                    .replace("N200 - ", "N200-")
+                    .replace(" ", "-")
+            )
+            _log_name = f"FT_STBX_{_stbx_model}_{_log_time}.log"
+
+        self.logger = Logger(TEST_LOGS_DIR / _log_name)
+        # ───────────────────────────────────────────────────────────────────
+
         self.lock_btn.setEnabled(False)
-        # 🔒 Disable start button once test begins
         self.start_btn.setEnabled(False)
+        
         model = self.alhx_combo.currentText().strip()
         now = datetime.now()
         # ==========================================================
         # 🔴 CASE 1: JUNCTION BOX MODE (ALH4)
         # ==========================================================
         if self.is_junction_box_mode():
-
+            set_generator_scale_factor(9.00)
             # 🔥 Load separate Junction Box template
-            create_model_report("ALH4")   # Your separate JB template name
+            create_model_report("N200 - ALH4")   # Your separate JB template name
 
             # Employee Details
             write_excel("E3", self.session_name)
@@ -1816,59 +2658,62 @@ class FullTestScreen(QMainWindow):
             # Station Box (ALH2 forced)
             write_excel("E5", model)
             write_excel("E6", self.alhx_serial.text().strip())
-            write_excel("E8", self.mod_combo.currentText())
+            write_excel("E8", self.mod_combo.text().strip())
 
             # 🔥 Junction Box Fields (Different Layout Area)
-            write_excel("H3", "ALH4")
+            write_excel("H3", "N200 - ALH4")
             write_excel("H4", self.jbox_serial.text().strip())
-            write_excel("H5", self.mod_jbox_combo.currentText())
+            write_excel("H5", self.mod_jbox_combo.text().strip())
 
             write_excel("E7", "Full Test Run - With Junction Box")
 
             write_excel("L4", now.strftime("%d-%m-%Y"))
             write_excel("L5", now.strftime("%H-%M-%S"))
         else:
+            set_generator_scale_factor(1.66)
             create_model_report(model)
             # ================= HEADER DATA WRITE =================
 
             # Employee Details
-            write_excel("C2", self.session_name)          # Employee Name
-            write_excel("C3", self.session_id)            # Employee ID
+            write_excel("C3", self.session_name)          # Employee Name
+            write_excel("C4", self.session_id)            # Employee ID
 
             # LRU / Model
-            write_excel("C4", model)                      # LRU (ALH1/2/3)
+            write_excel("C5", model)                      # LRU (ALH1/2/3)
 
             # Serial Number
-            write_excel("C5", self.alhx_serial.text().strip())
+            write_excel("C6", self.alhx_serial.text().strip())
 
             # Test Type
-            write_excel("C6", "Full test run")
+            write_excel("C7", "Full test run")
             # MOD (ALH Module)
-            write_excel("C7", self.mod_combo.currentText())
+            write_excel("F3", self.mod_combo.text().strip())
 
             # Date & Time
-            write_excel("G2", now.strftime("%d-%m-%Y"))   # Date
-            write_excel("G3", now.strftime("%H-%M-%S"))   # Time
+            write_excel("J4", now.strftime("%d-%m-%Y"))   # Date
+            write_excel("J5", now.strftime("%H-%M-%S"))   # Time
         # ✅ If Junction box mode (ALH4) → skip calibration popup
         if self.is_junction_box_mode():
             self.abort_event.clear()
             self.test_running = True
             self.logger.log("Junction Box mode ", False)
             self.log_text.clear()
-
+            install_apx_recovery_hooks(self)   # ← ADD
+            install_relay_hooks(self)
             # ✅ Run initialization in background thread
             self.init_thread = InitializationThread(self)
             self.init_thread.start()
             return
 
         # ✅ Normal mode → show calibration popup
-        calibration = CalibrationPopup(self)
+        calibration = CalibrationPopup(self, model=self.alhx_combo.currentText().strip())
         if calibration.exec_() == QDialog.Accepted:
             self.abort_event.clear()
             self.test_running = True
             self.logger.log("Calibration acknowledged - Starting test initialization", False)
             self.log_text.clear()
-
+            install_apx_recovery_hooks(self) 
+            install_relay_hooks(self)# ← ADD
             # ✅ Run initialization in background thread
             self.init_thread = InitializationThread(self)
             self.init_thread.start()
@@ -1876,205 +2721,648 @@ class FullTestScreen(QMainWindow):
 
 
     def run_initialization(self):
-        if self.is_junction_box_mode():
-            box_init.run_init_jbox(self)
-        else:
+        if not self.is_junction_box_mode():
             box_init.run_init_sb(self)
-        # RUN PSU AUTOMATION SEQUENCE (depends on Junction Box selection)
-        if self.is_junction_box_mode():
-            self.psu_thread = PSUAutomationThread(self)   # (later we can replace with PSUAutomationThreadJBox)
-            self.psu_thread.start()
-        else:
-            self.psu_thread = PSUAutomationThread(self)
-            self.psu_thread.start()
+
+        self.psu_thread = PSUAutomationThread(self)
+        self.psu_thread.start()
 
 
         
 
     def start_device_monitoring(self):
-        self.device_listeners = []
+        """
+        Start device listeners. Reuses existing healthy listeners across runs
+        instead of destroying and recreating them — avoids false-disconnect
+        on second test run.
+        """
+        # ── PSU listener: reuse if already running, else create fresh ──
+        existing_psu = next(
+            (l for l in self.device_listeners if isinstance(l, PSUListener)),
+            None
+        )
+        if existing_psu is not None and existing_psu.isRunning():
+            existing_psu.psu_inst = self.psu_inst
+            existing_psu.fail_count = 0
+            existing_psu.resume()
+            print("[DEVICE MONITOR] PSU listener reused from previous run")
+        else:
+            if not self.psu_inst:
+                try:
+                    if self.rm:
+                        self.psu_inst = self.find_psu()
+                except Exception as e:
+                    print(f"[DEVICE MONITOR] find_psu skipped — rm not ready: {e}")
+                    return
+            if self.psu_inst:
+                psu_listener = PSUListener(self.psu_inst, self.psu_lock)
+                psu_listener.disconnected.connect(self.on_device_disconnected)
+                self.device_listeners = [
+                    l for l in self.device_listeners
+                    if not isinstance(l, PSUListener)
+                ]
+                self.device_listeners.append(psu_listener)
+                psu_listener.start()
+                print("[DEVICE MONITOR] PSU listener created fresh")
 
-        # 🔴 FORCE PSU HANDLE BEFORE STARTING LISTENER
-        if not self.psu_inst:
-            self.psu_inst = self.find_psu()
-
-        if self.psu_inst:
-            psu_listener = PSUListener(self.psu_inst, self.psu_lock)
-            psu_listener.disconnected.connect(self.on_device_disconnected)
-            self.device_listeners.append(psu_listener)
-
-        # STM32 serial must be stored from ConnectionWorker
-        if hasattr(self, "stm32_serial") and self.stm32_serial:
+        # ── STM32 listener: reuse if already running, else create fresh ──
+        existing_stm32 = next(
+            (l for l in self.device_listeners if isinstance(l, STM32Listener)),
+            None
+        )
+        if existing_stm32 is not None and existing_stm32.isRunning():
+            existing_stm32.resume()
+            print("[DEVICE MONITOR] STM32 listener reused from previous run")
+        elif hasattr(self, "stm32_serial") and self.stm32_serial:
             mcu_listener = STM32Listener(self.stm32_serial)
             mcu_listener.disconnected.connect(self.on_device_disconnected)
+            self.device_listeners = [
+                l for l in self.device_listeners
+                if not isinstance(l, STM32Listener)
+            ]
             self.device_listeners.append(mcu_listener)
+            mcu_listener.start()
+            print("[DEVICE MONITOR] STM32 listener created fresh")
+            
 
-        for listener in self.device_listeners:
-            listener.start()
+
+    def _parse_log_line(self, message: str):
+        """
+        Returns list of (text, color) tuples for rich colorization.
+
+        Rules:
+        - Base text color: off-black #cccccc
+        - Values with units (numbers + unit): green if PASS context, red if FAIL context
+        - ✓ PASS / FAIL flags appended in matching color
+        - ERROR lines handled separately in append_log
+        """
+        OFF_BLACK  = "#cccccc"
+        PASS_GREEN = "#4caf50"
+        FAIL_RED   = "#ef5350"
+
+        # Detect overall pass/fail for this line
+        # Detect overall pass/fail for this line
+        upper = message.upper()
+        is_pass_line = "PASS" in upper or "✅" in upper or "✓" in upper or "SUCCESS" in upper or "SUCCESSFULLY" in upper
+        is_fail_line = "FAIL" in upper or "❌" in upper or "✗" in upper
+
+        # Unit pattern: number followed by a known unit (with optional space)
+        UNIT_PATTERN = re.compile(
+            r'(?<![a-zA-Z])'                          # not preceded by a letter
+            r'(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*'
+            r'(Vrms|mVrms|uVrms|µVrms|dBrA|dBu|dBm|dB|mVrms|mV|kΩ|GΩ|MΩ|Ω|ohm|kHz|MHz|Hz|ms|µs|us|mA|mW|rpm|°C|°F|%|V|A|s|W)'
+            r'(?=\s|,|;|\.|$|\)|\]|%)',
+            re.IGNORECASE
+        )
+
+        # Remove trailing PASS/FAIL text — we'll re-append as flag
+        clean = re.sub(r'\s*(✓\s*PASS|✗\s*FAIL|PASS|FAIL)\s*$', '', message, flags=re.IGNORECASE).rstrip()
+
+        value_color = PASS_GREEN if is_pass_line else (FAIL_RED if is_fail_line else OFF_BLACK)
+
+        parts = []
+        OL_PATTERN = re.compile(r'\bOL\b', re.IGNORECASE)
+
+        # Merge both patterns and sort by position
+        matches = sorted(
+            [(m, "unit") for m in UNIT_PATTERN.finditer(clean)] +
+            [(m, "ol")   for m in OL_PATTERN.finditer(clean)],
+            key=lambda x: x[0].start()
+        )
+
+        last = 0
+        for m, kind in matches:
+            if m.start() > last:
+                parts.append((clean[last:m.start()], OFF_BLACK))
+            parts.append((m.group(0), value_color))
+            last = m.end()
+
+        # Remaining text
+        if last < len(clean):
+            parts.append((clean[last:], OFF_BLACK))
+
+        # Append check flag only if not already present in the message
+        already_has_pass = "✓ PASS" in message or "PASS ✅" in message or "✅" in message
+        already_has_fail = "✗ FAIL" in message or "FAIL ❌" in message or "❌" in message
+
+        if is_pass_line and not already_has_pass:
+            parts.append((" ✓ PASS", PASS_GREEN))
+        elif is_fail_line and not already_has_fail:
+            parts.append((" ✗ FAIL", FAIL_RED))
+
+        return parts if parts else [(message, OFF_BLACK)]
 
     def append_log(self, message: str, error: bool = False):
-        """
-        Append timestamped message to running logs.
-        Only logs ACTIONS, never live voltage values (to avoid spam).
-        """
+        if getattr(self, "_psu_error_handled", False):
+            reconnect_keywords = ("PSU", "🔁", "✅", "⚠", "❌", "Relay", "reconnect", "Restoring")
+            if not any(kw in message for kw in reconnect_keywords):
+                return
         timestamp = datetime.now().strftime("%H:%M:%S")
-
-        # ✅ STORE logs with error flag (for Detailed Logs Viewer)
         self.logs_history.append((timestamp, message, error))
 
+        cursor = self.log_text.textCursor()
+        cursor.movePosition(cursor.End)
+
+        def insert(text, color):
+            fmt = self.log_text.currentCharFormat()
+            fmt.setForeground(QColor(color))
+            cursor.insertText(text, fmt)
+
+        # Timestamp in dim gray
+        insert(f"[{timestamp}] ", "#666666")
+
         if error:
-            self.log_text.setTextColor(QColor("#d32f2f"))  # Red for errors
+            # Full line in red for errors
+            insert(message + "\n", "#ef5350")
+        elif message.startswith("==========") and message.endswith("=========="):
+            # Section separator lines in yellow
+            insert(message + "\n", "#fbc02d")
         else:
-            self.log_text.setTextColor(QColor("#1b5e20"))  # Green for normal
+            # Parse for PASS/FAIL flags and value+unit patterns
+            html_parts = self._parse_log_line(message)
+            for text, color in html_parts:
+                insert(text, color)
+            insert("\n", "#cccccc")
 
-        self.log_text.append(f"[{timestamp}] {message}")
+        self.log_text.setTextCursor(cursor)
+        self.log_text.ensureCursorVisible()
         self.logger.log(message, error)
-
-        # Reset text color
-        self.log_text.setTextColor(QColor("#333"))
 
         
     def show_test_completion(self):
-        # 🔴 TURN OFF PSU OUTPUT IMMEDIATELY
+        self._psu_error_handled = True        # ← block any PSU error callbacks
+        self._disconnect_in_progress = True   # ← block disconnect popup trigger
+        # 🔴 STOP MONITORING FIRST — before touching PSU
+        # This prevents the monitor thread from seeing a "disconnect"
+        # when we turn off PSU output below
         try:
-            if self.psu_inst:
-                with self.psu_lock:
-                    self.psu_inst.write("OUTP OFF")
-                self.log_signal.emit("⚠ PSU OUTPUT TURNED OFF (Abort)", True)
-        except Exception as e:
-            self.log_signal.emit(f"PSU OFF failed during abort: {e}", True)
+            self.stop_voltage_monitoring()
+        except Exception:
+            pass
+        
+        # AFTER:
+        try:
+            self.unfreeze_psu_front_panel()
+            self.psu_send_command("*CLS")
+            time.sleep(0.05)
+            self.psu_send_command("SYST:LOC")
+            time.sleep(0.1)
+        except Exception:
+            pass
+
+        # Pause listeners during PSU shutdown — avoids false disconnect triggers
+        for listener in getattr(self, "device_listeners", []):
+            try:
+                listener.pause()
+            except Exception:
+                pass
+            
+        self._turn_off_psu_channels([1, 2, 3], context="test completion")
+        
+        # ✅ Set disconnect flag AFTER stopping threads so no false trigger
+        self._disconnect_in_progress = True
+
+        self.test_running = False
+
         self.start_btn.setEnabled(True)
-        completion = TestCompletionModal(self)
-        completion.exec_()
-            # ================= WRITE RESULT =================
-        # ✅ FINAL OVERALL RESULT
-        if self.overall_test_passed:
-            result = "PASS"
+        
+        self.lock_btn.setEnabled(True)       # ← re-enable lock button
+        # ================= WRITE RESULT FIRST =================
+        # if self.overall_test_passed:
+        #     result = "PASS"
+        # else:
+        #     result = "FAIL"
+        result = "FAIL" if has_any_fail_in_report() else "PASS"
+
+        if self.is_junction_box_mode():
+            write_excel("L6", result)
         else:
-            result = "FAIL"
-
-        write_excel("G4", result)
-
+            write_excel("J6", result)
         finalize_report()
+        try:
+            generator_control(self, state="off")  # ensure generator is off at end of test
+        except Exception:
+            pass
+        try:
+            remove_apx_recovery_hooks()
+            remove_relay_hooks()
+        except Exception:
+            pass
+        # ================= RENAME FILE WITH FINAL NAME =================
 
-        completion = TestCompletionModal(self)
-        completion.exec_()
+        model_short = self.alhx_combo.currentText().strip().replace("N200 - ", "N200-").replace(" ", "-")
+        jbox_short = self.jbox_combo.currentText().strip().replace("N200 - ", "N200-").replace(" ", "-")
+        date_str = dt.now().strftime("%d%m%Y")
+        time_str = dt.now().strftime("%H%M")
+
+        if self.is_junction_box_mode():
+            serial = self.jbox_serial.text().strip().replace(" ", "_") or "UNKNOWN"
+            final_name = f"FT_{jbox_short}_JNBX_{serial}_{result}_{date_str}_{time_str}"
+        else:
+            serial = self.alhx_serial.text().strip().replace(" ", "_") or "UNKNOWN"
+            final_name = f"FT_{model_short}_STBX_{serial}_{result}_{date_str}_{time_str}"
+        report_path = rename_report(final_name)
+
+        # ================= SHOW POPUP ONCE AFTER RESULT WRITTEN =================
+        # Full test → save as xlsx
+        completion = TestCompletionModal(self, report_path=report_path, save_as_pdf=True, result=result)
+        dialog_result = completion.exec_()
+
+        # ✅ Clear logs regardless of Save or Close
+        self.log_text.clear()
+        self.logs_history.clear()
+        self._per_test_results = {}
+        self.overall_test_passed = True  # reset for next run
+        self.channel_ocp_limits.clear()
+        self._ocp_tripped_channels.clear()
+        self._disconnect_done = False
+        self._psu_error_handled = False
+        self._disconnect_in_progress = False
+        self._reconnect_in_progress = False
+        self.voltage_stop_event.clear()
+        self.abort_event.clear()
+        self.operator_event.clear()
+        self._reconnect_event.clear()          # ← ADD
+        self._awaiting_reconnect_ack = False   # ← ADD
+        self._psu_ready_event.set()
+        self.log_signal.emit("Logs cleared after test completion.", False)
         
     def disconnect_and_return(self):
         """
-        DISCONNECT button handler with handshake
-        + Aborts current test if running
+        DISCONNECT button handler.
+        Turns off all PSU channels (with automatic rediscovery/retry if the
+        current PSU handle is stale) and returns to the connection screen.
+        No STM32 serial handshake — that's been removed from this path.
         """
         # ✅ Abort running test FIRST
         if self.test_running:
             self.log_signal.emit("DISCONNECT clicked → Aborting current test...", True)
-
-            # trigger abort flag
             self.abort_event.set()
+            self.abort_test_internal(reset_relays=False)
 
-            # safely stop threads + listeners + UI reset
-            self.abort_test_internal()
-
-        # ✅ Now do disconnect handshake
-        success = self.perform_disconnect_handshake()
-
-        # ✅ Popup result
+        # ✅ Turn off all PSU channels (rediscovers PSU internally if needed)
+        success = self._safe_shutdown_all_psu_channels(context="disconnect")
         dialog = DisconnectResultDialog(success, self)
         dialog.exec_()
-
         if success:
+            self._psu_already_confirmed_off = True   # ← skip redundant re-shutdown in closeEvent
             self.return_to_connection.emit()
             self.close()
 
 
     def abort_test(self):
-        # Only allow abort if test is running
         if not self.test_running:
-            QMessageBox.information(self, "Abort Test", "No test is currently running.")
+            popup = OperatorInfoPopup(
+                title="Abort Test",
+                message="No test is currently running.",
+                image_path=RESOURCES_DIR / "remove.png",
+                buttons="ok",
+                timer_seconds=None,
+                image_size=96,
+                parent=self,
+            )
+            popup.exec_()
             return
+
+        # ── Pause the test IMMEDIATELY — before the confirmation popup even
+        # shows — so no other popup can slip in between. Also freeze popup
+        # delivery so nothing already queued pops up while we wait.
+        self._abort_pending_event.clear()
+        self._popup_busy = True
 
         confirm = AbortTestConfirmationPopup(self)
         if confirm.exec_() != QDialog.Accepted:
+            # ── Operator cancelled — resume the test right where it was ──
+            self._popup_busy = False
+            self._abort_pending_event.set()
+            self._trigger_queue_signal.emit()   # let any queued popup show now
             return
 
-        #  Show terminating popup
-        terminating_popup = OperatorInfoPopup(
+        # ── Operator confirmed — release the popup gate (abort_event now
+        # takes over) and proceed with the real abort ──
+        self._popup_busy = False
+        self._abort_pending_event.set()
+
+        # ── 1. Signal abort ──────────────────────────────────────────
+        self.abort_event.set()
+        self._psu_shutdown_in_progress = True   # bail any in-flight reconnect ASAP
+        self._reconnect_generation += 1         # orphan any reconnect thread now running
+        self.operator_event.set()          # unblock any operator_event.wait()
+
+        # ── Cut PSU outputs immediately — do not wait for worker threads to
+        # unwind or for the operator to click through the save/discard
+        # dialog further down; that can take seconds to minutes.
+        # abort_test_internal() re-confirms this later; this just closes
+        # the gap. Silent — print() only, nothing to the on-screen logs.
+        try:
+            self._safe_shutdown_all_psu_channels(context="abort - immediate")
+        except Exception as e:
+            print(f"[ABORT] Immediate PSU shutdown check failed: {e}")
+
+        # Drop any test-flow popup still waiting in the queue — once abort
+        # begins none of them should appear. Left unclear, closing the
+        # currently-shown dialog below can trigger the next queued one to
+        # pop up mid-abort, and if its widget gets force-closed in the same
+        # tick that raises RuntimeError on the deleted Qt object.
+        with self._popup_queue_lock:
+            self._popup_queue.clear()
+
+        self._force_close_all_dialogs()    # close open operator popups
+
+        # ── 2. Let worker threads exit cleanly first; terminate only as fallback ──
+        self._stop_worker_thread(self.psu_thread, "Test thread")
+        self._stop_worker_thread(self.init_thread, "Init thread")
+
+        # ── 3. Ask operator: save partial report or discard? ─────────
+        #    (runs on main thread — safe because threads are already dead)
+        self._show_abort_save_dialog()
+
+    def _show_abort_save_dialog(self):
+        # --- build dialog ---
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Test Aborted")
+        dlg.setModal(True)
+        dlg.setFixedWidth(420)
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+
+        icon_label = QLabel("⚠")
+        icon_label.setFont(QFont("Arial", 28))
+        icon_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(icon_label)
+
+        title_label = QLabel("Test was aborted")
+        title_label.setFont(QFont("Arial", 13, QFont.Bold))
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet("color: #d32f2f;")
+        layout.addWidget(title_label)
+
+        body_label = QLabel(
+            "Results collected so far have been recorded in the report.\n"
+            "Would you like to save the partial report or discard it?"
+        )
+        body_label.setWordWrap(True)
+        body_label.setAlignment(Qt.AlignCenter)
+        body_label.setStyleSheet("color: #555555; font-size: 11px;")
+        layout.addWidget(body_label)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(12)
+
+        save_btn = QPushButton("💾  Save Partial Report")
+        save_btn.setMinimumHeight(38)
+        save_btn.setFont(QFont("Arial", 10, QFont.Bold))
+        save_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1976d2;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+            }
+            QPushButton:hover { background-color: #1565c0; }
+            QPushButton:pressed { background-color: #0d47a1; }
+        """)
+
+        discard_btn = QPushButton("🗑  Discard")
+        discard_btn.setMinimumHeight(38)
+        discard_btn.setFont(QFont("Arial", 10, QFont.Bold))
+        discard_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #757575;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+            }
+            QPushButton:hover { background-color: #616161; }
+            QPushButton:pressed { background-color: #424242; }
+        """)
+
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(discard_btn)
+        layout.addLayout(btn_row)
+
+        self._abort_save_choice = "discard"
+
+        def on_save():
+            self._abort_save_choice = "save"
+            dlg.accept()
+
+        def on_discard():
+            self._abort_save_choice = "discard"
+            dlg.accept()
+
+        save_btn.clicked.connect(on_save)
+        discard_btn.clicked.connect(on_discard)
+
+        dlg.exec_()   # blocks until user clicks — main thread, no background threads running yet
+
+        # ── Save report and show TestCompletionModal FIRST ──────────
+        if self._abort_save_choice == "save":
+            try:
+                from datetime import datetime as _dt
+
+                result = "FAIL" if has_any_fail_in_report() else "PASS"
+                self._abort_report_result = result
+
+                if self.is_junction_box_mode():
+                    write_excel("L6", result + " (PARTIAL)")
+                else:
+                    write_excel("G4", result + " (PARTIAL)")
+
+                finalize_report()
+
+                model_short = (
+                    self.alhx_combo.currentText().strip()
+                        .replace("N200 - ", "N200-")
+                        .replace(" ", "-")
+                )
+                date_str = _dt.now().strftime("%d%m%Y")
+                time_str = _dt.now().strftime("%H%M")
+
+                if self.is_junction_box_mode():
+                    serial = self.jbox_serial.text().strip().replace(" ", "_") or "UNKNOWN"
+                    final_name = f"ABORT_{model_short}_JNBX_{serial}_{result}_{date_str}_{time_str}"
+                else:
+                    serial = self.alhx_serial.text().strip().replace(" ", "_") or "UNKNOWN"
+                    final_name = f"ABORT_{model_short}_STBX_{serial}_{result}_{date_str}_{time_str}"
+
+                # ✅ rename ONCE only
+                report_path = rename_report(final_name)
+                self.log_signal.emit(f"Partial report saved as: {final_name}", False)
+
+                # ✅ Show TestCompletionModal NOW — before relay reset popup
+                # This runs on main thread, no background thread conflict
+                completion = TestCompletionModal(
+                    self,
+                    report_path=report_path,
+                    save_as_pdf=True,
+                    result=result
+                )
+                completion.exec_()   # user clicks OK/Save here — blocks cleanly
+
+            except Exception as e:
+                self.log_signal.emit(f"Report save failed: {e}", True)
+        else:
+            self.log_signal.emit("Partial report discarded.", False)
+
+        # ── NOW show 'Terminating Test' popup + start relay reset ───
+        self.terminating_popup = OperatorInfoPopup(
             title="Terminating Test",
-            message="Terminating the test...\nPlease wait.",
+            message=(
+                "Stopping test…\n"
+                "Switching all relays to default state.\n\n"
+                "Please wait — OK will become available\n"
+                "once all relays have been reset."
+            ),
             image_path=None,
             buttons="ok",
-            timer_seconds=2,
-            parent=self
+            timer_seconds=None,
+            parent=self,
         )
-        terminating_popup.show()
+
+        # Disable OK until relay reset completes
+        QTimer.singleShot(0, self._disable_terminating_ok)
+        self.terminating_popup.show()
+        self.terminating_popup.finished.connect(lambda _: self._on_abort_popup_closed())
         QApplication.processEvents()
 
-        # ✅ Trigger abort flag (thread-safe)
-        self.abort_event.set()
-
-        # ✅ Stop test safely
-        self.abort_test_internal()
-
-        # ✅ Clear logs
-        self.log_text.clear()
-
-        # ✅ Close popup if still open
-        terminating_popup.close()
+        # ── Start relay reset in background ──────────────────────────
+        # If the abort was triggered by a relay-comms failure (Problems 1/4),
+        # skip set_default_states() — the bus is already unreliable.
+        self._abort_worker = AbortWorkerThread(
+            self, reset_relays=False
+        )
+        self._abort_worker.finished.connect(self._on_abort_finished)
+        self._abort_worker.start()
 
 
-    def abort_test_internal(self):
-        """Forcefully abort running test + cleanup"""
-
-        # 🔴 TURN OFF PSU OUTPUT IMMEDIATELY
+    def _on_abort_finished(self):
+        """
+        Called on main thread when AbortWorkerThread finishes.
+        Relays are now in default state — re-enable OK button only.
+        TestCompletionModal was already shown BEFORE this point.
+        """
         try:
-            if self.psu_inst:
-                with self.psu_lock:
-                    self.psu_inst.write("OUTP OFF")
-                self.log_signal.emit("⚠ PSU OUTPUT TURNED OFF (Abort)", True)
-        except Exception as e:
-            self.log_signal.emit(f"PSU OFF failed during abort: {e}", True)
-        
-
-        # 🔥 FORCE SAVE CURRENT REPORT
-        try:
-            finalize_report()
-        except:
+            if hasattr(self, "terminating_popup") and self.terminating_popup is not None:
+                for btn in self.terminating_popup.findChildren(QPushButton):
+                    btn.setEnabled(True)
+                    btn.setToolTip("")
+                self.log_signal.emit("✓ All relays reset — you may now close the popup.", False)
+        except RuntimeError:
             pass
 
-        self.test_running = False
-        self.start_btn.setEnabled(True)
 
-        # Release any operator waits
+    def _disable_terminating_ok(self):
+        """Disable every QPushButton inside the terminating popup."""
+        if not hasattr(self, "terminating_popup") or self.terminating_popup is None:
+            return
+        for btn in self.terminating_popup.findChildren(QPushButton):
+            btn.setEnabled(False)
+            btn.setToolTip("Please wait until relay reset is complete.")
+
+
+
+    def _on_abort_popup_closed(self):
+        self.terminating_popup = None
+        with self._popup_queue_lock:
+            self._popup_queue.clear()
+        self._popup_busy = False
+        self.log_text.clear()
+        self.logs_history.clear()
+        self.log_signal.emit("Logs cleared after abort.", False)
+
+
+
+    def abort_test_internal(self, reset_relays=True):
+        """Forcefully abort running test + cleanup"""
+
+        # ⚠️ DO NOT call _force_close_all_dialogs here — this runs on a background
+        # thread during abort. Dialog closing must happen on the main thread only.
+        # _force_close_all_dialogs() is called in abort_test() on the main thread.
+
+        self._psu_shutdown_in_progress = True
+        self._reconnect_generation += 1
+        # after
+        try:
+            generator_control(self, state="off")
+        except Exception:
+            pass  # APx crash during abort — safe to ignore
+
+        # 🔴 TURN OFF PSU OUTPUT IMMEDIATELY — authoritative path, rediscovers
+        # the PSU if psu_inst is stale/None rather than silently skipping.
+        self._safe_shutdown_all_psu_channels(context="abort")
+
+        try:
+            self.unfreeze_psu_front_panel()
+        except Exception:
+            pass
+        
+        try:
+            self.psu_send_command("*CLS")
+            time.sleep(0.1)
+            self.psu_send_command("SYST:LOC")
+            time.sleep(0.1)
+        except Exception:
+            pass
+
+        # 🔥 SAVE REPORT
+        try:
+            finalize_report()
+            if getattr(self, "_abort_save_choice", "save") == "save":
+                self.log_signal.emit("Report saved successfully", False)
+        except Exception as e:
+            self.log_signal.emit(f"Report save failed: {e}", True)
+
+        # 🔴 RESET RELAYS
+        if reset_relays:
+            try:
+                self.log_signal.emit("Switching all relays to default state...", True)
+                if STM32RelayController.send_with_retry(STM32RelayController.set_default_states):
+                    self.log_signal.emit("✓ All relays successfully set to default state", False)
+                else:
+                    self.log_signal.emit("WARNING: Some relays may not have reset to default", True)
+            except Exception as e:
+                self.log_signal.emit(f"Relay reset failed during abort: {e}", True)
+        try:
+            remove_apx_recovery_hooks()
+            remove_relay_hooks()
+        except Exception:
+            pass
+        remove_tuning_hooks()
+        RelayStateTracker.clear()
+        self.channel_ocp_limits.clear()
+        self._ocp_tripped_channels.clear()
+        self.test_running = False
+        self.start_btn.setEnabled(True)   # ⚠️ This emits to main thread via Qt — safe via signal
+
         try:
             self.operator_event.set()
         except Exception:
             pass
-
-        # Stop monitoring
+        self._psu_ready_event.set()
         try:
             self.stop_voltage_monitoring()
         except Exception:
             pass
 
-        # Stop listeners
         for listener in getattr(self, "device_listeners", []):
             try:
-                listener.stop()
-                listener.wait()
+                listener.pause()
             except Exception:
                 pass
 
-        # Stop PSU automation thread
-        if self.psu_thread and self.psu_thread.isRunning():
-            try:
-                self.psu_thread.terminate()
-                self.psu_thread.wait(2000)
-            except Exception:
-                pass
-
-        # Reset UI state
         self.unlock_configuration()
         self.lock_btn.setEnabled(True)
+        self._disconnect_done = False
+        self._psu_error_handled = False
+        self._disconnect_in_progress = False
+        self._reconnect_in_progress = False
+        self._reconnect_event.clear()       
+        self._awaiting_reconnect_ack = False 
 
         self.log_signal.emit("✗ Test aborted by user", True)
 
@@ -2095,64 +3383,100 @@ class FullTestScreen(QMainWindow):
             if isinstance(widget, QMessageBox):
                 widget.close()
 
+    def _stop_worker_thread(self, thread, label: str, graceful_ms: int = 2500, force_ms: int = 2000):
+        """
+        abort_event/operator_event are already set by the time this is called,
+        so the worker thread's check_abort() / relay-escalation wait() should
+        already be raising TEST_ABORTED_BY_USER and unwinding on its own —
+        which properly releases psu_lock via its `with` block.
 
+        terminate() is a last resort: it's an OS-level kill that bypasses
+        Python's exception unwinding entirely, so if the thread is killed
+        mid `with self.psu_lock:` the lock never gets released and every
+        subsequent PSU command (including our own abort cleanup) hangs forever.
+        """
+        if thread is None or not thread.isRunning():
+            return
+        if thread.wait(graceful_ms):
+            print(f"[{label}] Test paused.")
+            return
+        self.log_signal.emit(f"{label} did not stop in time — forcing stop.", True)
+        thread.terminate()
+        thread.wait(force_ms)
+        self._reset_psu_lock_if_stuck()
+
+    def _reset_psu_lock_if_stuck(self):
+        """
+        A forcefully terminated worker thread may have been killed while
+        holding self.psu_lock. Python's Lock can't be force-released from
+        outside, so if it's still locked, swap in a fresh one rather than
+        let every future PSU command hang forever.
+        """
+        try:
+            if self.psu_lock.locked():
+                self.log_signal.emit(
+                    "⚠ PSU lock appeared stuck after forced stop — resetting it.", True
+                )
+                self.psu_lock = Lock()
+        except Exception:
+            pass
 
     def on_device_disconnected(self, device: DeviceType, message: str):
-        # 🔴 Prevent multiple triggers
         if self._disconnect_in_progress:
             return
+        if getattr(self, "_reconnect_in_progress", False):
+            return
+        if getattr(self, "_psu_error_handled", False):
+            return
+
+        lock = getattr(self, "_reconnect_lock", None)
+        if lock is not None and not lock.acquire(blocking=False):
+            print("[DISCONNECT HANDLER] Reconnect lock held — skipping")
+            return
+        if lock is not None:
+            lock.release()
+
+        if device == DeviceType.PSU:
+            if getattr(self, "_disconnect_in_progress", False):
+                return
+            self._psu_error_handled = True
+            import threading
+            threading.Thread(
+                target=self._background_reconnect,
+                daemon=True,
+                name="PSU-reconnect-listener"
+            ).start()
+            return
+
+        # Non-PSU device (e.g. STM32) — hard abort
         self._disconnect_in_progress = True
-
-        # 🚨 Abort test immediately on device disconnect
-        self.abort_test_internal()
-
-
-        # 🔕 Release any operator wait()
+        self._psu_shutdown_in_progress = True
+        self._reconnect_generation += 1
+        self.abort_test_internal(reset_relays=False)   # authoritative PSU shutdown happens inside
         try:
             self.operator_event.set()
         except Exception:
             pass
-
-        # Stop voltage monitoring
         self.stop_voltage_monitoring()
-
-        # Best-effort PSU OFF
-        try:
-            if self.psu_inst:
-                self.psu_inst.write("OUTP OFF")
-        except Exception:
-            pass
-
-        # Stop device listeners
+        # Belt-and-suspenders confirmation, in case this races ahead of abort_test_internal.
+        self._safe_shutdown_all_psu_channels(context="device disconnect")
         for listener in self.device_listeners:
             listener.stop()
             listener.wait()
-
-        # 🔥 FORCE CLOSE ALL EXISTING POPUPS
         self._force_close_all_dialogs()
-
-        # 🔔 Show ONLY ONE disconnect popup
+        from PyQt5.QtWidgets import QMessageBox
         msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Critical)
         msg.setWindowTitle(f"{device.value} Disconnected")
-        msg.setText(
-            f"{message}\n"
-            "Test aborted.\n"
-            "Returning to connection screen…"
-        )
+        msg.setText(f"{message}\nTest aborted.\nReturning to connection screen…")
         msg.setStandardButtons(QMessageBox.Ok)
-
-        # On OK → close screen and return to connection page
         msg.buttonClicked.connect(
             lambda _: (
-                self.close(),
-                self.return_to_connection.emit()
+                self.return_to_connection.emit(),
+                QTimer.singleShot(100, self.close),
             )
         )
-
         msg.exec_()
-
-
 
 
 
@@ -2191,20 +3515,21 @@ class FullTestScreen(QMainWindow):
 
             for port in stm32_ports:
                 try:
-                    ser = serial.Serial(port, 115200, timeout=2)
+                    with STM32RelayController._bus_lock:
+                        ser = serial.Serial(port, 115200, timeout=2)
 
-                    start, slave, length = 0x02, 0x35, 0x02
-                    command, state = 0xFF, 0xE0
-                    end, eof = 0x03, 0x0D
+                        start, slave, length = 0x02, 0x35, 0x02
+                        command, state = 0xFF, 0xE0
+                        end, eof = 0x03, 0x0D
 
-                    crc_val = crc8([start, slave, length, command, state, end, eof])
-                    frame = bytearray([start, slave, length, command, state, crc_val, end, eof])
+                        crc_val = crc8([start, slave, length, command, state, end, eof])
+                        frame = bytearray([start, slave, length, command, state, crc_val, end, eof])
 
-                    ser.write(frame)
-                    time.sleep(0.5)
+                        ser.write(frame)
+                        time.sleep(0.5)
 
-                    response = ser.read(8)
-                    ser.close()
+                        response = ser.read(8)
+                        ser.close()
 
                     if len(response) != 8:
                         continue
@@ -2223,23 +3548,156 @@ class FullTestScreen(QMainWindow):
             return False
 
     def closeEvent(self, event):
+        # ─────────────────────────────────────────────────────────────────
+        # If a test is running we must abort it cleanly BEFORE closing,
+        # so relays get time to settle and the PSU is switched off.
+        # ─────────────────────────────────────────────────────────────────
+        if self.test_running:
+            event.ignore()
+
+            popup = OperatorInfoPopup(
+                title="⚠ Test In Progress",
+                message=(
+                    "A test is currently running.\n\n"
+                    "Please click  'Abort Test'  first and wait for it\n"
+                    "to finish, then close the window.\n\n"
+                    "Click  'Force Close'  only if absolutely necessary\n"
+                    "(relays will NOT be reset)."
+                ),
+                image_path=None,
+                buttons="yes_no",   # yes = Force Close, no = Cancel
+                timer_seconds=None,
+                parent=self,
+            )
+            # Relabel the buttons so intent is clear
+            for btn in popup.findChildren(QPushButton):
+                # after
+                if btn.text().strip().upper() in ("YES", "Y"):
+                    btn.setText("Force Close")
+                    btn.setMinimumWidth(160)
+                    btn.setMinimumHeight(36)
+                    btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+                    btn.setStyleSheet("""
+                        QPushButton {
+                            background-color: #d32f2f;
+                            color: white;
+                            border: none;
+                            border-radius: 4px;
+                            padding: 8px 20px;
+                            font-weight: bold;
+                        }
+                        QPushButton:hover { background-color: #b71c1c; }
+                    """)
+                elif btn.text().strip().upper() in ("NO", "N"):
+                    btn.setText("Cancel")
+                    btn.setMinimumWidth(100)
+                    btn.setMinimumHeight(36)
+
+            result = popup.exec_()
+
+            if result == QDialog.Accepted:
+                # Force Close — run cleanup on a background thread instead of
+                # blocking the GUI. If the relay bus is corrupted (consecutive
+                # comms failures), abort_test_internal's retries can take a
+                # long time — doing that on the main thread freezes the whole
+                # window and makes it *look* like the button did nothing.
+                self.abort_event.set()
+                self._psu_shutdown_in_progress = True
+                self._reconnect_generation += 1
+                self.operator_event.set()
+
+                # ── Same immediate cutoff as Abort — worker-thread stop and
+                # the "cleaning up" popup below can still take a while.
+                # Silent — print() only.
+                try:
+                    self._safe_shutdown_all_psu_channels(context="force close - immediate")
+                except Exception as e:
+                    print(f"[FORCE CLOSE] Immediate PSU shutdown check failed: {e}")
+
+                self._force_close_all_dialogs()
+
+                self._close_popup = OperatorInfoPopup(
+                    title="Closing Application",
+                    message=(
+                        "Cleaning up and closing…\n\n"
+                        "Please wait — this window will close automatically."
+                    ),
+                    image_path=None,
+                    buttons="ok",
+                    timer_seconds=None,
+                    parent=self,
+                )
+                for btn in self._close_popup.findChildren(QPushButton):
+                    btn.setEnabled(False)
+                    btn.setToolTip("Please wait until cleanup is complete.")
+                self._close_popup.show()
+                QApplication.processEvents()
+
+                self._stop_worker_thread(self.psu_thread, "Test thread")
+                self._stop_worker_thread(self.init_thread, "Init thread")
+
+                self._close_worker = AbortWorkerThread(
+                    self, reset_relays=False
+                )
+                self._close_worker.finished.connect(self._on_close_abort_finished)
+                self._close_worker.start()
+            # else: Cancel — window stays open, user uses Abort Test button
+            return
+
+        # ── Normal close (no test running) ───────────────────────────────
         try:
-            # 1️⃣ Stop voltage monitoring thread
             if self.voltage_monitor_thread:
                 self.stop_voltage_monitoring()
-                time.sleep(0.5)
 
-            # 2️⃣ STOP DEVICE LISTENER THREADS  ⬅️ ADD HERE
             for listener in getattr(self, "device_listeners", []):
                 listener.stop()
                 listener.wait()
 
-            # 3️⃣ Close PSU VISA session
-            if self.psu_inst:
-                self.psu_inst.close()
-
         except Exception:
             pass
 
+        # ── Turn off ALL PSU channels before closing — mirrors single_test_screen ──
+        if not getattr(self, "_psu_already_confirmed_off", False):
+            self._safe_shutdown_all_psu_channels(context="window close")
+            app_instance = QApplication.instance()
+            if hasattr(app_instance, "_trigger_psu_shutdown"):
+                app_instance._trigger_psu_shutdown(existing_psu=self.psu_inst)
         event.accept()
 
+    def _on_close_abort_finished(self):
+        """
+        Called on the main thread once AbortWorkerThread completes.
+        Relays have settled → safe to close the window now.
+        """
+        # Close the "please wait" popup
+        try:
+            if hasattr(self, "_close_popup") and self._close_popup is not None:
+                self._close_popup.close()
+                self._close_popup = None
+        except Exception:
+            pass
+
+        # Stop remaining background resources
+        try:
+            if self.voltage_monitor_thread:
+                self.stop_voltage_monitoring()
+
+            for listener in getattr(self, "device_listeners", []):
+                listener.stop()
+                listener.wait()
+        except Exception:
+            pass
+
+        # ── Final belt-and-suspenders PSU shutdown right before the window
+        # actually closes — covers the case where a worker thread had to be
+        # force-terminate()'d mid PSU-command. print() only, no log_signal:
+        # the log widget is being torn down and nothing needs to show
+        # on-screen at this point.
+        try:
+            self._safe_shutdown_all_psu_channels(context="force close - final cleanup")
+        except Exception as e:
+            print(f"[FORCE CLOSE] Final PSU shutdown check failed: {e}")
+
+        # Now actually close — test_running is False after abort_test_internal(),
+        # so closeEvent will take the normal path and call event.accept().
+        self.close()

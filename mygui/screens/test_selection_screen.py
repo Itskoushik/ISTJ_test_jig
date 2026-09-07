@@ -1,22 +1,23 @@
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import pyqtSignal, Qt
-from PyQt5.QtGui import QFont, QPixmap
-from PyQt5.QtGui import QIcon
+from PyQt5.QtGui import *
 from PyQt5.QtCore import QSize , QTimer
-
+from core.screen_utils import sp, responsive_size, responsive_geometry
+from matplotlib.pylab import outer
 from screens.lru_selection import Singletestselection
 from core.paths import RESOURCES_DIR, PDF_TEST_REPORTS_DIR
-
+from screens.test_reports_screen import EmptyStateDialog
+import time
 class DisconnectPopup(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Disconnect")
-        self.setFixedSize(420, 240)
+        self.setFixedSize(responsive_size(0.30, 0.38, min_w=460, min_h=360, max_w=560, max_h=460))
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setContentsMargins(sp(30), sp(30), sp(30), sp(50))
 
         card = QFrame()
         card.setStyleSheet("""
@@ -26,26 +27,90 @@ class DisconnectPopup(QDialog):
                 border: 1px solid #e5e7eb;
             }
         """)
+
+        shadow = QGraphicsDropShadowEffect(card)
+        shadow.setBlurRadius(sp(24))
+        shadow.setXOffset(0)
+        shadow.setYOffset(sp(6))
+        shadow.setColor(QColor(0, 0, 0, 90))
+        card.setGraphicsEffect(shadow)
+
         outer.addWidget(card)
 
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(12)
+        layout.setContentsMargins(sp(18), sp(18), sp(18), sp(18))
+        layout.setSpacing(sp(12))
+        
+        # Icon badge (socket.png in a circular red-tinted background)
+        icon_wrap = QLabel()
+        icon_wrap.setFixedSize(sp(72), sp(72))
+        icon_wrap.setAlignment(Qt.AlignCenter)
+        icon_wrap.setStyleSheet("""
+            QLabel {
+                background-color: #fdecea;
+                border-radius: %dpx;
+            }
+        """ % (sp(36)))
+        socket_pixmap = QPixmap(str(RESOURCES_DIR / "socket.png"))
+        if not socket_pixmap.isNull():
+            icon_wrap.setPixmap(socket_pixmap.scaled(sp(34), sp(34), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        layout.addWidget(icon_wrap, 0, Qt.AlignCenter)
+        layout.addSpacing(sp(10))
 
         # Title row
         title = QLabel("Disconnect ISTJ")
-        title.setFont(QFont("Arial", 13, QFont.Bold))
+        title.setFont(QFont("Arial", sp(15), QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("color: #111827; border: none;")
         layout.addWidget(title)
 
-        self.sub = QLabel("Do you want to disconnect and return to connection screen?")
-        self.sub.setFont(QFont("Arial", 10))
+        divider = QFrame()
+        divider.setFrameShape(QFrame.HLine)
+        divider.setStyleSheet("color: #e5e7eb; background-color: #e5e7eb; max-height: 1px;")
+        layout.addWidget(divider)
+        layout.addSpacing(sp(6))
+
+        self.sub = QLabel("Do you want to disconnect from ISTJ and return to the connection screen?")
+        self.sub.setFont(QFont("Arial", sp(11)))
         self.sub.setWordWrap(True)
+        self.sub.setAlignment(Qt.AlignCenter)
         self.sub.setStyleSheet("color: #374151; border: none;")
         layout.addWidget(self.sub)
+        layout.addSpacing(sp(10))
+
+        info_box = QFrame()
+        info_box.setStyleSheet("""
+            QFrame {
+                background-color: #eaf2fb;
+                border: 1px solid #cfe0f5;
+                border-radius: 8px;
+            }
+        """)
+        info_layout = QHBoxLayout(info_box)
+        info_layout.setContentsMargins(sp(12), sp(10), sp(12), sp(10))
+        info_layout.setSpacing(sp(10))
+
+        info_icon = QLabel("i")
+        info_icon.setFixedSize(sp(20), sp(20))
+        info_icon.setAlignment(Qt.AlignCenter)
+        info_icon.setStyleSheet("""
+            background-color: #1a5da8;
+            color: white;
+            border-radius: %dpx;
+            font-weight: bold;
+        """ % sp(10))
+
+        info_text = QLabel("Ongoing tests will be stopped and any unsaved data may be lost.")
+        info_text.setWordWrap(True)
+        info_text.setFont(QFont("Arial", sp(9)))
+        info_text.setStyleSheet("color: #1a5da8; border: none;")
+
+        info_layout.addWidget(info_icon, 0, Qt.AlignTop)
+        info_layout.addWidget(info_text)
+        layout.addWidget(info_box)
 
         self.status = QLabel("")
-        self.status.setFont(QFont("Arial", 10, QFont.Bold))
+        self.status.setFont(QFont("Arial", sp(10), QFont.Bold))
         self.status.setStyleSheet("color: #1a5da8; border: none;")
         layout.addWidget(self.status)
 
@@ -53,10 +118,12 @@ class DisconnectPopup(QDialog):
 
         # Buttons row
         btn_row = QHBoxLayout()
-        btn_row.addStretch()
+        btn_row.setSpacing(sp(12))
 
-        self.no_btn = QPushButton("Cancel")
-        self.no_btn.setFixedSize(110, 36)
+        self.no_btn = QPushButton("  Cancel")
+        self.no_btn.setFixedSize(sp(180), sp(44))
+        self.no_btn.setIcon(QIcon(str(RESOURCES_DIR / "cancel_x.png")))  # or reuse an existing X icon
+        self.no_btn.setIconSize(QSize(sp(14), sp(14)))
         self.no_btn.setStyleSheet("""
             QPushButton {
                 background: #ffffff;
@@ -68,8 +135,12 @@ class DisconnectPopup(QDialog):
             QPushButton:hover { background: #f9fafb; }
         """)
 
-        self.yes_btn = QPushButton("Disconnect")
-        self.yes_btn.setFixedSize(130, 36)
+        self.yes_btn = QPushButton("  Disconnect")
+        self.yes_btn.setFixedSize(sp(180), sp(44))
+        socket_btn_icon = QPixmap(str(RESOURCES_DIR / "socket.png"))
+        if not socket_btn_icon.isNull():
+            self.yes_btn.setIcon(QIcon(socket_btn_icon))
+        self.yes_btn.setIconSize(QSize(sp(16), sp(16)))
         self.yes_btn.setStyleSheet("""
             QPushButton {
                 background: #d32f2f;
@@ -81,8 +152,10 @@ class DisconnectPopup(QDialog):
             QPushButton:hover { background: #b71c1c; }
         """)
 
+        btn_row.addStretch()
         btn_row.addWidget(self.no_btn)
         btn_row.addWidget(self.yes_btn)
+        btn_row.addStretch()
 
         layout.addLayout(btn_row)
 
@@ -120,16 +193,19 @@ class TestSelectionScreen(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self.setUpdatesEnabled(False)   # ✅ Suppress repaints during construction
         self.setWindowTitle("HAL - Test Selection")
-        self.setGeometry(100, 100, 900, 700)
-        self.setMinimumSize(900, 700)
+        self.setWindowIcon(QIcon(str(RESOURCES_DIR / "istj.png")))
+        x, y, w, h = responsive_geometry(0.55, 0.8, min_w=800, min_h=650, max_w=1300, max_h=1000)
+        self.setGeometry(x, y, w, h)
+        self.setMinimumSize(sp(800), sp(650))
         self.setStyleSheet("background-color: #f5f5f5;")
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
-        layout.setContentsMargins(40, 40, 40, 40)
-        layout.setSpacing(18)
+        layout.setContentsMargins(sp(40), sp(40), sp(40), sp(40))
+        layout.setSpacing(sp(18))
         # ==============================
         # TOP HEADER BAR (Logo + Title + Disconnect)
         # ==============================
@@ -141,17 +217,17 @@ class TestSelectionScreen(QMainWindow):
                 border-radius: 0px;
             }
         """)
-        top_bar.setFixedHeight(80)
+        top_bar.setFixedHeight(sp(80))
 
         top_layout = QHBoxLayout(top_bar)
-        top_layout.setContentsMargins(20, 10, 20, 10)
-        top_layout.setSpacing(10)
+        top_layout.setContentsMargins(sp(20), sp(10), sp(20), sp(10))
+        top_layout.setSpacing(sp(10))
 
         # Logo Left
         logo_label = QLabel()
         logo_pixmap = QPixmap(str(RESOURCES_DIR / "hal_logo.png"))
         if not logo_pixmap.isNull():
-            logo_pixmap = logo_pixmap.scaledToWidth(140, Qt.SmoothTransformation)
+            logo_pixmap = logo_pixmap.scaledToWidth(sp(140), Qt.SmoothTransformation)
         logo_label.setPixmap(logo_pixmap)
         logo_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         top_layout.addWidget(logo_label)
@@ -161,12 +237,12 @@ class TestSelectionScreen(QMainWindow):
 
         # Disconnect Button Right
         disconnect_btn = QPushButton()
-        disconnect_btn.setMinimumHeight(44)
-        disconnect_btn.setMinimumWidth(160)
-        disconnect_btn.setMaximumWidth(160)
+        disconnect_btn.setMinimumHeight(sp(44))
+        disconnect_btn.setMinimumWidth(sp(160))
+        disconnect_btn.setMaximumWidth(sp(160))
         disconnect_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        disconnect_btn.setFont(QFont("Arial", 8, QFont.Bold))
-        disconnect_btn.setIconSize(QSize(15, 15))
+        disconnect_btn.setFont(QFont("Arial", sp(8), QFont.Bold))
+        disconnect_btn.setIconSize(QSize(sp(15), sp(15)))
 
         disconnect_icon = QPixmap(str(RESOURCES_DIR / "disconnect.png"))
         if not disconnect_icon.isNull():
@@ -200,7 +276,7 @@ class TestSelectionScreen(QMainWindow):
         # TITLE BELOW HEADER
         # ==============================
         title_label = QLabel("Select Mode")
-        title_label.setFont(QFont("Arial", 18, QFont.Bold))
+        title_label.setFont(QFont("Arial", sp(18), QFont.Bold))
         title_label.setAlignment(Qt.AlignCenter)
         title_label.setStyleSheet("""
             QLabel {
@@ -219,15 +295,15 @@ class TestSelectionScreen(QMainWindow):
         # Grid Layout Container for 2x2 buttons
         grid_container = QWidget()
         grid_layout = QGridLayout(grid_container)
-        grid_layout.setContentsMargins(20, 20, 20, 20)
-        grid_layout.setHorizontalSpacing(24)
-        grid_layout.setVerticalSpacing(24)
+        grid_layout.setContentsMargins(sp(20), sp(20), sp(20), sp(20))
+        grid_layout.setHorizontalSpacing(sp(24))
+        grid_layout.setVerticalSpacing(sp(24))
 
         # =========================
         # ROW 0, COL 0: RUN FULL TEST BUTTON (PRIMARY)
         # =========================
         full_test_btn = QPushButton()
-        full_test_btn.setMinimumSize(280, 200)
+        full_test_btn.setMinimumSize(sp(280), sp(200))
         full_test_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         full_test_btn.setStyleSheet("""
             QPushButton {
@@ -247,7 +323,7 @@ class TestSelectionScreen(QMainWindow):
 
         full_layout = QVBoxLayout(full_test_btn)
         full_layout.setContentsMargins(0, 0, 0, 0)
-        full_layout.setSpacing(16)
+        full_layout.setSpacing(sp(16))
         full_layout.setAlignment(Qt.AlignCenter)
 
         full_icon = QLabel()
@@ -259,7 +335,7 @@ class TestSelectionScreen(QMainWindow):
         full_icon.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         full_text = QLabel("RUN FULL TEST")
-        full_text.setFont(QFont("Arial", 12, QFont.Bold))
+        full_text.setFont(QFont("Arial", sp(12), QFont.Bold))
         full_text.setStyleSheet("color: white; background-color: transparent; border: none; padding: 0px; margin: 0px; letter-spacing: 0.3px;")
         full_text.setAlignment(Qt.AlignCenter)
         full_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -276,7 +352,7 @@ class TestSelectionScreen(QMainWindow):
         # ROW 0, COL 1: RUN SINGLE TEST BUTTON (SECONDARY)
         # =========================
         unit_test_btn = QPushButton()
-        unit_test_btn.setMinimumSize(280, 200)
+        unit_test_btn.setMinimumSize(sp(280), sp(200))
         unit_test_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         unit_test_btn.setStyleSheet("""
             QPushButton {
@@ -298,7 +374,7 @@ class TestSelectionScreen(QMainWindow):
 
         unit_layout = QVBoxLayout(unit_test_btn)
         unit_layout.setContentsMargins(0, 0, 0, 0)
-        unit_layout.setSpacing(16)
+        unit_layout.setSpacing(sp(16))
         unit_layout.setAlignment(Qt.AlignCenter)
 
         unit_icon = QLabel()
@@ -310,7 +386,7 @@ class TestSelectionScreen(QMainWindow):
         unit_icon.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         unit_text = QLabel("RUN SINGLE TEST")
-        unit_text.setFont(QFont("Arial", 12, QFont.Bold))
+        unit_text.setFont(QFont("Arial", sp(12), QFont.Bold))
         unit_text.setStyleSheet("color: #374151; background-color: transparent; border: none; padding: 0px; margin: 0px; letter-spacing: 0.3px;")
         unit_text.setAlignment(Qt.AlignCenter)
         unit_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -327,7 +403,7 @@ class TestSelectionScreen(QMainWindow):
         # ROW 1, COL 0: CALIBRATIONS BUTTON (SECONDARY)
         # =========================
         calibrations_btn = QPushButton()
-        calibrations_btn.setMinimumSize(280, 200)
+        calibrations_btn.setMinimumSize(sp(280), sp(200))
         calibrations_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         calibrations_btn.setStyleSheet("""
             QPushButton {
@@ -349,19 +425,19 @@ class TestSelectionScreen(QMainWindow):
 
         calib_layout = QVBoxLayout(calibrations_btn)
         calib_layout.setContentsMargins(0, 0, 0, 0)
-        calib_layout.setSpacing(16)
+        calib_layout.setSpacing(sp(16))
         calib_layout.setAlignment(Qt.AlignCenter)
 
         calib_icon = QLabel()
         calib_icon.setPixmap(QPixmap(str(RESOURCES_DIR / "calibrations.png")).scaled(
-            64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation
-        ) if QPixmap(str(RESOURCES_DIR / "calibrations.png")).isNull() == False else QPixmap(64, 64))
+            sp(64), sp(64), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        ) if QPixmap(str(RESOURCES_DIR / "calibrations.png")).isNull() == False else QPixmap(sp(64), sp(64)))
         calib_icon.setAlignment(Qt.AlignCenter)
         calib_icon.setStyleSheet("background-color: transparent; border: none; padding: 0px; margin: 0px;")
         calib_icon.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         calib_text = QLabel("EQUIPMENT SELF TEST")
-        calib_text.setFont(QFont("Arial", 12, QFont.Bold))
+        calib_text.setFont(QFont("Arial", sp(12), QFont.Bold))
         calib_text.setStyleSheet("color: #374151; background-color: transparent; border: none; padding: 0px; margin: 0px; letter-spacing: 0.3px;")
         calib_text.setAlignment(Qt.AlignCenter)
         calib_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -379,7 +455,7 @@ class TestSelectionScreen(QMainWindow):
         # ROW 1, COL 1: TEST REPORTS BUTTON (SECONDARY)
         # =========================
         reports_btn = QPushButton()
-        reports_btn.setMinimumSize(280, 200)
+        reports_btn.setMinimumSize(sp(280), sp(200))
         reports_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         reports_btn.setStyleSheet("""
             QPushButton {
@@ -401,19 +477,19 @@ class TestSelectionScreen(QMainWindow):
 
         reports_layout = QVBoxLayout(reports_btn)
         reports_layout.setContentsMargins(0, 0, 0, 0)
-        reports_layout.setSpacing(16)
+        reports_layout.setSpacing(sp(16))
         reports_layout.setAlignment(Qt.AlignCenter)
 
         reports_icon = QLabel()
         reports_icon.setPixmap(QPixmap(str(RESOURCES_DIR / "test_reports.png")).scaled(
-            64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation
-        ) if QPixmap(str(RESOURCES_DIR / "test_reports.png")).isNull() == False else QPixmap(64, 64))
+            sp(64), sp(64), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        ) if QPixmap(str(RESOURCES_DIR / "test_reports.png")).isNull() == False else QPixmap(sp(64), sp(64)))
         reports_icon.setAlignment(Qt.AlignCenter)
         reports_icon.setStyleSheet("background-color: transparent; border: none; padding: 0px; margin: 0px;")
         reports_icon.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         reports_text = QLabel("PRINT REPORT")
-        reports_text.setFont(QFont("Arial", 12, QFont.Bold))
+        reports_text.setFont(QFont("Arial", sp(12), QFont.Bold))
         reports_text.setStyleSheet("color: #374151; background-color: transparent; border: none; padding: 0px; margin: 0px; letter-spacing: 0.3px;")
         reports_text.setAlignment(Qt.AlignCenter)
         reports_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -435,6 +511,7 @@ class TestSelectionScreen(QMainWindow):
 
         layout.addWidget(grid_container, 1)
         layout.addStretch()
+        self.setUpdatesEnabled(True)
 
     def on_calibrations_clicked(self):
         self.equipment_self_test_requested.emit()
@@ -447,52 +524,19 @@ class TestSelectionScreen(QMainWindow):
         pdf_files = list(PDF_TEST_REPORTS_DIR.glob("*.pdf"))
 
         if not pdf_files:
-            # Improved "No Reports" dialog with better styling
-            msg_box = QMessageBox(self)
-            msg_box.setWindowTitle("No Test Reports")
-            msg_box.setText("No test reports found")
-            msg_box.setInformativeText(
-                "There are currently no PDF reports available.\n\n"
-                "Run tests and generate reports to see them here."
-            )
-            msg_box.setIcon(QMessageBox.Information)
-            msg_box.setStyleSheet("""
-            QMessageBox {
-                background-color: #ffffff;
-                border: none;
-            }
-
-            QMessageBox QFrame {
-                border: none;
-                background-color: transparent;
-            }
-
-            QMessageBox QLabel {
-                color: #374151;
-                background-color: transparent;
-            }
-
-            QMessageBox QLabel#qt_msgbox_informativelabel {
-                color: #666666;
-                font-size: 9pt;
-                background-color: transparent;
-            }
-
-            QMessageBox QPushButton {
-                min-width: 80px;
-                min-height: 32px;
-                background-color: #1a5da8;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-
-            QMessageBox QPushButton:hover {
-                background-color: #154a8a;
-            }
-        """)
-            msg_box.exec_()
+            EmptyStateDialog(
+                self,
+                title="No Test Reports",
+                icon_path=RESOURCES_DIR / "pdf.png",
+                heading="No test reports found",
+                description_lines=[
+                    "There are currently no PDF reports available.",
+                    "Run tests and generate reports to see them here.",
+                ],
+                tip_icon_path=RESOURCES_DIR / "lab.png",
+                tip_title="Generate reports",
+                tip_desc="Run your tests to generate PDF reports that will appear here.",
+            ).exec_()
             return
 
         # PDFs exist → ask application to open Test Reports
@@ -524,68 +568,81 @@ class TestSelectionScreen(QMainWindow):
 
 
     def perform_disconnect_handshake(self) -> bool:
-        try:
-            import serial
-            import serial.tools.list_ports
-            import time
+        """
+        Disconnect sequence:
+        1. Find PSU and try to turn off all channels.
+        2. If that attempt fails, re-discover the PSU (fresh instrument handle)
+        and retry turning off all channels once.
+        Returns True if either attempt succeeded.
+        """
+        import pyvisa
 
-            def crc8(data):
-                crc = 0x00
-                poly = 0x07
-                for byte in data:
-                    crc ^= byte
-                    for _ in range(8):
-                        if crc & 0x80:
-                            crc = ((crc << 1) ^ poly) & 0xFF
-                        else:
-                            crc = (crc << 1) & 0xFF
-                return crc
-
-            ports = list(serial.tools.list_ports.comports())
-            stm32_ports = []
-
-            for port in ports:
-                if any(k in port.description for k in ["Bluetooth", "Wireless", "Intel", "Modem"]):
-                    continue
-                if (
-                    port.vid == 0x0483
-                    or "STM32" in port.description
-                    or "ST-Link" in port.description
-                    or "USB Serial" in port.description
-                ):
-                    stm32_ports.append(port.device)
-
-            for port in stm32_ports:
+        def find_psu(resource_manager):
+            for resource in resource_manager.list_resources():
                 try:
-                    ser = serial.Serial(port, 115200, timeout=2)
-
-                    start, slave, length = 0x02, 0x35, 0x02
-                    command, state = 0xFF, 0xE0
-                    end, eof = 0x03, 0x0D
-
-                    crc_val = crc8([start, slave, length, command, state, end, eof])
-                    frame = bytearray([start, slave, length, command, state, crc_val, end, eof])
-
-                    ser.write(frame)
-                    time.sleep(0.5)
-
-                    response = ser.read(8)
-                    ser.close()
-
-                    if len(response) != 8:
-                        continue
-
-                    rs, rsl, rl, rc, rst, rcrc, re, reof = response
-                    if (rs == 0x02 and rsl == 0x35 and rl == 0x02 and re == 0x03 and reof == 0x0D):
-                        if crc8([rs, rsl, rl, rc, rst, re, reof]) == rcrc:
-                            if rc == 0xFF and rst == 0xE1:
-                                return True
-
+                    inst = resource_manager.open_resource(resource)
+                    inst.timeout = 2000
+                    idn = inst.query("*IDN?").strip()
+                    if "RIGOL" in idn.upper() and "DP8" in idn.upper():
+                        return inst
+                    inst.close()
                 except Exception:
                     continue
+            return None
 
-            return False
+        def turn_off_all_channels(inst):
+            for ch in [1, 2, 3]:
+                inst.write(f"INST:NSEL {ch}")
+                time.sleep(0.1)
+                inst.write("OUTP OFF")
+                time.sleep(0.1)
 
-        except Exception:
-            return False
+        rm = None
+        psu_inst = None
+        shutdown_ok = False
 
+        # ---------- Attempt 1 ----------
+        try:
+            rm = pyvisa.ResourceManager()
+            psu_inst = find_psu(rm)
+            if psu_inst:
+                turn_off_all_channels(psu_inst)
+                shutdown_ok = True
+                print("[DISCONNECT] All PSU channels turned OFF (attempt 1)")
+            else:
+                print("[DISCONNECT] PSU not found (attempt 1)")
+        except Exception as e:
+            print(f"[DISCONNECT] Attempt 1 failed: {e}")
+
+        # ---------- Attempt 2: fresh PSU handle, retry ----------
+        if not shutdown_ok:
+            try:
+                if psu_inst:
+                    try:
+                        psu_inst.close()
+                    except Exception:
+                        pass
+                if rm is None:
+                    rm = pyvisa.ResourceManager()
+                psu_inst = find_psu(rm)
+                if psu_inst:
+                    turn_off_all_channels(psu_inst)
+                    shutdown_ok = True
+                    print("[DISCONNECT] All PSU channels turned OFF (attempt 2)")
+                else:
+                    print("[DISCONNECT] PSU not found (attempt 2)")
+            except Exception as e:
+                print(f"[DISCONNECT] Attempt 2 failed: {e}")
+
+        if psu_inst:
+            try:
+                psu_inst.close()
+            except Exception:
+                pass
+        if rm:
+            try:
+                rm.close()
+            except Exception:
+                pass
+
+        return shutdown_ok

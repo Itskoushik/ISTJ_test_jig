@@ -4,12 +4,18 @@ from PyQt5.QtCore import Qt
 from core.paths import RESOURCES_DIR
 
 
+MODEL_IMAGES = {
+    "N200 - ALH1": "alh1.png",
+    "N200 - ALH2": "alh2.png",
+    "N200 - ALH3": "alh3.png",
+}
+
 
 class CalibrationPopup(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, model: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Message")
-        self.setGeometry(200, 200, 600, 400)
+        self.setGeometry(200, 200, 700, 550) 
         self.setModal(True)
         self.setStyleSheet("background-color: #ffffff;")
 
@@ -22,26 +28,25 @@ class CalibrationPopup(QDialog):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
-        # Knob Image
+        # Pick image based on selected model; fall back to sb.png
+        image_file = MODEL_IMAGES.get(model, "sb.png")
         knob_label = QLabel()
-        knob_pixmap = QPixmap(str(RESOURCES_DIR / "knob.png"))
+        knob_pixmap = QPixmap(str(RESOURCES_DIR / image_file))
         if knob_pixmap.isNull():
-            knob_pixmap = QPixmap(150, 150)
+            knob_pixmap = QPixmap(500, 400)
             knob_pixmap.fill(QColor("#e0e0e0"))
         else:
-            knob_pixmap = knob_pixmap.scaledToWidth(150, Qt.SmoothTransformation)
+            knob_pixmap = knob_pixmap.scaled(500, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         knob_label.setPixmap(knob_pixmap)
         knob_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(knob_label)
 
         # Instructions
         instructions = QLabel(
-            "• Connect cables J65 to J101 and J66 to J102.\n"
             "• Turn the ICS knobs fully CW.\n"
             "• Set MIC Mode to HOT.\n"
             "• Turn TX SEL knobs fully CCW and to the OUT position.\n"
             "• Turn RX SEL knobs fully CCW.\n"
-            "• STBY/NORM switch to NORM position."
         )
         instructions.setFont(QFont("Arial", 10))
         instructions.setAlignment(Qt.AlignLeft)
@@ -51,12 +56,13 @@ class CalibrationPopup(QDialog):
         layout.addStretch()
 
         # Acknowledge Button
-        ack_btn = QPushButton("I Acknowledge")
-        ack_btn.setMinimumHeight(40)
-        ack_btn.setMaximumWidth(200)
-        ack_btn.setFont(QFont("Arial", 11, QFont.Bold))
-        ack_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        ack_btn.setStyleSheet("""
+        self.ack_btn = QPushButton("I Acknowledge")
+        self.ack_btn.setMinimumHeight(40)
+        self.ack_btn.setMaximumWidth(200)
+        self.ack_btn.setFont(QFont("Arial", 11, QFont.Bold))
+        self.ack_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.ack_btn.setFocusPolicy(Qt.StrongFocus)
+        self.ack_btn.setStyleSheet("""
             QPushButton {
                 background-color: #1a5da8;
                 color: white;
@@ -68,11 +74,24 @@ class CalibrationPopup(QDialog):
                 background-color: #154a8a;
             }
         """)
-        ack_btn.clicked.connect(self.accept)
-        
+        self.ack_btn.clicked.connect(self.accept)
+
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-        btn_layout.addWidget(ack_btn)
+        btn_layout.addWidget(self.ack_btn)
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
+        self.ack_btn.setFocus()
         
+    def keyPressEvent(self, event):
+        key = event.key()
+
+        if key == Qt.Key_Escape:
+            event.ignore()
+            return
+
+        if key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self.ack_btn.click()
+            return
+
+        super().keyPressEvent(event)

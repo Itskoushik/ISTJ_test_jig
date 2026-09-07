@@ -6,7 +6,7 @@ class OscilloscopeIdentification:
     """Data class to store parsed oscilloscope identification information."""
     
     def __init__(self, manufacturer: str, model: str, 
-                 serial_number: str, firmware_version: str):
+        serial_number: str, firmware_version: str):
         self.manufacturer = manufacturer
         self.model = model
         self.serial_number = serial_number
@@ -71,33 +71,19 @@ class OscilloscopeConnection:
         resources = self.rm.list_resources()
         return list(resources)
     
-    def _parse_idn_response(self, idn_response: str) -> Optional[OscilloscopeIdentification]:
-        """Parse SCPI *IDN? response: <Mfg>,<Model>,<SN>,<FW>"""
-        try:
-            parts = [p.strip() for p in idn_response.strip().split(',')]
-            
-            if len(parts) < 4:
-                return None
-            
-            manufacturer = parts[0]
-            model = parts[1]
-            serial_number = parts[2]
-            firmware_version = parts[3]
-            
-            if not all([manufacturer, model, serial_number, firmware_version]):
-                return None
-            
-            identification = OscilloscopeIdentification(
-                manufacturer=manufacturer,
-                model=model,
-                serial_number=serial_number,
-                firmware_version=firmware_version
+    def _parse_idn_response(self, idn_response: str):
+
+        parts = [p.strip() for p in idn_response.strip().split(',')]
+
+        if len(parts) >= 4:
+            return OscilloscopeIdentification(
+                manufacturer=parts[0],
+                model=parts[1],
+                serial_number=parts[2],
+                firmware_version=",".join(parts[3:])
             )
-            
-            return identification
-            
-        except Exception:
-            return None
+
+        return None
     
     def _is_oscilloscope(self, idn_response: str) -> bool:
         """Heuristic check for oscilloscope manufacturer identifiers."""
@@ -169,54 +155,63 @@ class OscilloscopeConnection:
         
         # Attempt connection and identification for each resource
         for resource_string in resources:
+
             if resource_string in self.claimed_visa_resources:
                 continue
 
-            
             try:
+                # print(f"Checking: {resource_string}")   # 🔥 DEBUG
+
                 resource = self._attempt_connection(resource_string)
                 if not resource:
                     continue
-                
+
                 self._configure_resource(resource)
-                
+
                 idn_response = self._query_identification(resource)
+
                 if not idn_response:
+                    # print(f"No IDN response: {resource_string}")
                     resource.close()
                     continue
-                
-                if not self._is_oscilloscope(idn_response):
+
+                # print(f"IDN Response: {idn_response}")   # 🔥 DEBUG
+
+                # ✅ STRICT TEKTRONIX CHECK
+                if "TEKTRONIX" not in idn_response.upper():
                     resource.close()
                     continue
-                
+
                 identification = self._parse_idn_response(idn_response)
+
                 if not identification:
+                    # print("Failed to parse IDN")
                     resource.close()
                     continue
-                
-                # Connection successful
+
+                # ✅ STORE CORRECT VALUES
                 self.instrument = resource
                 self.identification = identification
                 self.resource_string = resource_string
+
                 self.claimed_visa_resources.add(resource_string)
 
-                
                 if self._validate_communication():
                     return True
                 else:
-                    # ❌ Validation failed → release claim
                     self.claimed_visa_resources.discard(resource_string)
                     resource.close()
                     self.instrument = None
                     continue
 
-            except Exception:
-                try:
-                    resource.close()
-                except:
-                    pass
+            except Exception as e:
+                # print("ERROR:", e)
+                if 'resource' in locals():
+                    try:
+                        resource.close()
+                    except:
+                        pass
                 continue
-        
         return False
     
     def close(self) -> None:

@@ -1,11 +1,12 @@
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QUrl
-from PyQt5.QtGui import QFont, QColor, QPixmap, QDesktopServices
+from PyQt5.QtGui import  *
 from datetime import datetime
 from workers.connection_worker import ConnectionWorker
 from core.logger import Logger, export_logs_to_pdf
 from core.paths import RESOURCES_DIR, LOGS_DIR, LOGS_PDF_DIR
-
+from screens.full_test_screen import *
+from core.screen_utils import sp, responsive_size, responsive_geometry
 
 
 
@@ -13,6 +14,7 @@ from core.paths import RESOURCES_DIR, LOGS_DIR, LOGS_PDF_DIR
 class ConnectionScreen(QMainWindow):
     connection_success = pyqtSignal()
     test_selection_requested = pyqtSignal()
+    logout_requested = pyqtSignal()
 
     def __init__(self, user_name, user_id):
         super().__init__()
@@ -28,7 +30,9 @@ class ConnectionScreen(QMainWindow):
         self.oscilloscope_connection = None
         
         self.setWindowTitle("HAL - Connection")
-        self.setGeometry(100, 100, 700, 800)
+        self.setWindowIcon(QIcon(str(RESOURCES_DIR / "istj.png")))
+        x, y, w, h = responsive_geometry(0.4, 0.85, min_w=600, min_h=650, max_w=900, max_h=1000)
+        self.setGeometry(x, y, w, h)
         self.setStyleSheet("background-color: #ffffff;")
 
         central_widget = QWidget()
@@ -42,8 +46,8 @@ class ConnectionScreen(QMainWindow):
         top_layout.addStretch()
 
         self.logout_btn = QPushButton("Logout")
-        self.logout_btn.setFixedSize(120, 40)
-        self.logout_btn.setFont(QFont("Arial", 10, QFont.Bold))
+        self.logout_btn.setFixedSize(sp(120), sp(40))
+        self.logout_btn.setFont(QFont("Arial", sp(10), QFont.Bold))
         self.logout_btn.setStyleSheet("""
             QPushButton {
                 background-color: white;
@@ -67,19 +71,19 @@ class ConnectionScreen(QMainWindow):
         logo_label = QLabel()
         logo_pixmap = QPixmap(str(RESOURCES_DIR / "hal_logo.png"))
         if logo_pixmap.isNull():
-            logo_pixmap = QPixmap(150, 75)
+            logo_pixmap = QPixmap(sp(150), sp(75))
             logo_pixmap.fill(QColor("#1a5da8"))
         else:
-            logo_pixmap = logo_pixmap.scaledToWidth(150, Qt.SmoothTransformation)
+            logo_pixmap = logo_pixmap.scaledToWidth(sp(150), Qt.SmoothTransformation)
         logo_label.setPixmap(logo_pixmap)
         logo_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(logo_label)
 
         # Connect Button
         self.connect_btn = QPushButton("CONNECT")
-        self.connect_btn.setMinimumHeight(45)
-        self.connect_btn.setMaximumWidth(250)
-        self.connect_btn.setFont(QFont("Arial", 11, QFont.Bold))
+        self.connect_btn.setMinimumHeight(sp(45))
+        self.connect_btn.setMaximumWidth(sp(250))
+        self.connect_btn.setFont(QFont("Arial", sp(11), QFont.Bold))
         self.connect_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.connect_btn.setStyleSheet("""
             QPushButton {
@@ -104,8 +108,8 @@ class ConnectionScreen(QMainWindow):
         # Log Panel
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMinimumHeight(300)
-        self.log_text.setFont(QFont("Courier", 9))
+        self.log_text.setMinimumHeight(sp(300))
+        self.log_text.setFont(QFont("Courier", sp(9)))
         self.log_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.log_text.setStyleSheet("""
             QTextEdit {
@@ -119,10 +123,10 @@ class ConnectionScreen(QMainWindow):
 
         # View Logs Button
         self.view_logs_btn = QPushButton("VIEW LOGS")
-        self.view_logs_btn.setMinimumHeight(40)
-        self.view_logs_btn.setMaximumWidth(250)
+        self.view_logs_btn.setMinimumHeight(sp(40))
+        self.view_logs_btn.setMaximumWidth(sp(250))
         self.view_logs_btn.setVisible(False)
-        self.view_logs_btn.setFont(QFont("Arial", 10, QFont.Bold))
+        self.view_logs_btn.setFont(QFont("Arial", sp(10), QFont.Bold))
         self.view_logs_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.view_logs_btn.setStyleSheet("""
             QPushButton {
@@ -140,10 +144,10 @@ class ConnectionScreen(QMainWindow):
         
         
         self.print_logs_btn = QPushButton("PRINT LOG")
-        self.print_logs_btn.setMinimumHeight(40)
-        self.print_logs_btn.setMaximumWidth(250)
+        self.print_logs_btn.setMinimumHeight(sp(40))
+        self.print_logs_btn.setMaximumWidth(sp(250))
         self.print_logs_btn.setVisible(False)
-        self.print_logs_btn.setFont(QFont("Arial", 10, QFont.Bold))
+        self.print_logs_btn.setFont(QFont("Arial", sp(10), QFont.Bold))
         self.print_logs_btn.setStyleSheet("""
             QPushButton {
                 background-color: #1976d2;
@@ -174,7 +178,14 @@ class ConnectionScreen(QMainWindow):
         self.retry_timer = QTimer()
         self.retry_timer.timeout.connect(self.retry_countdown)
         self.connection_in_progress = False
-        
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if self.connect_btn.isEnabled():
+                self.connect_btn.click()
+            return
+        super().keyPressEvent(event)
+
     def start_connection(self):
 
         # Prevent multiple clicks
@@ -195,29 +206,143 @@ class ConnectionScreen(QMainWindow):
         self.start_actual_connection()
         
     def show_logout_popup(self):
-        reply = QMessageBox.question(
-            self,
-            "Logout",
-            "Are you sure you want to logout?",
-            QMessageBox.Yes | QMessageBox.No
-        )
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Logout")
+        dlg.setModal(True)
+        dlg.setFixedSize(responsive_size(0.24, 0.20, min_w=340, min_h=230, max_w=420, max_h=260))
+        dlg.setStyleSheet("""
+            QDialog {
+                background-color: #ffffff;
+            }
+        """)
 
-        if reply == QMessageBox.Yes:
-            from screens.login_screen import LoginScreen
+        main = QVBoxLayout(dlg)
+        main.setContentsMargins(sp(22), sp(14), sp(22), sp(14))
+        main.setSpacing(sp(3))
 
-            self.login_screen = LoginScreen()
-            self.login_screen.show()
+        # ===== ICON BADGE (circular, with logout.png + decorative dots) =====
+        badge_wrap = QWidget()
+        badge_wrap.setFixedSize(sp(64), sp(64))
 
-            # reconnect login flow
-            self.login_screen.login_success.connect(self.reopen_connection_screen)
+        badge = QLabel(badge_wrap)
+        badge.setGeometry(sp(6), sp(6), sp(52), sp(52))
+        badge.setAlignment(Qt.AlignCenter)
+        badge.setStyleSheet("""
+            background-color: #eaf2fb;
+            border-radius: %dpx;
+        """ % sp(26))
 
+        logout_pixmap = QPixmap(str(RESOURCES_DIR / "logout.png"))
+        if not logout_pixmap.isNull():
+            badge.setPixmap(logout_pixmap.scaled(sp(24), sp(24), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+        # small decorative dots around the badge
+        dot_positions = [(sp(3), sp(13), sp(5)), (sp(9), sp(49), sp(4)),
+                        (sp(55), sp(19), sp(4)), (sp(51), sp(45), sp(5))]
+        for dx, dy, dsize in dot_positions:
+            dot = QLabel(badge_wrap)
+            dot.setGeometry(dx, dy, dsize, dsize)
+            dot.setStyleSheet("""
+                background-color: #cfe0f5;
+                border-radius: %dpx;
+            """ % (dsize // 2))
+
+        main.addWidget(badge_wrap, 0, Qt.AlignCenter)
+        main.addSpacing(sp(1))
+
+        # ===== TITLE + DIVIDER =====
+        title = QLabel("Logout")
+        title.setAlignment(Qt.AlignCenter)
+        title.setFont(QFont("Arial", sp(14), QFont.Bold))
+        title.setStyleSheet("color: #111827; border: none;")
+        main.addWidget(title)
+
+        divider = QFrame()
+        divider.setFixedWidth(sp(50))
+        divider.setFixedHeight(sp(2))
+        divider.setStyleSheet("background-color: #1a5da8; border-radius: 1px;")
+        main.addWidget(divider, 0, Qt.AlignCenter)
+        main.addSpacing(sp(6))
+
+        # ===== MESSAGE =====
+        msg1 = QLabel("Are you sure you want to logout?")
+        msg1.setAlignment(Qt.AlignCenter)
+        msg1.setFont(QFont("Arial", sp(9), QFont.Bold))
+        msg1.setStyleSheet("color: #111827; border: none;")
+        main.addWidget(msg1)
+
+        msg2 = QLabel("You will be disconnected from the system.")
+        msg2.setAlignment(Qt.AlignCenter)
+        msg2.setFont(QFont("Arial", sp(8)))
+        msg2.setStyleSheet("color: #6b7280; border: none;")
+        main.addWidget(msg2)
+
+        main.addSpacing(sp(12))
+
+        # ===== BUTTON ROW =====
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(sp(10))
+
+        no_btn = QPushButton("  Stay ")
+        no_btn.setFixedSize(sp(140), sp(32))
+        no_btn.setFont(QFont("Arial", sp(9), QFont.Bold))
+        no_btn.setCursor(Qt.PointingHandCursor)
+        no_icon = QPixmap(str(RESOURCES_DIR / "remove blue.png"))
+        if not no_icon.isNull():
+            no_btn.setIcon(QIcon(no_icon))
+        no_btn.setIconSize(QSize(sp(14), sp(14)))
+        no_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ffffff;
+                border: 2px solid #1a5da8;
+                color: #1a5da8;
+                border-radius: 6px;
+            }
+            QPushButton:hover { background-color: #eaf2fb; }
+        """)
+        no_btn.clicked.connect(dlg.reject)
+
+        yes_btn = QPushButton("  Logout ")
+        yes_btn.setFixedSize(sp(140), sp(32))
+        yes_btn.setFont(QFont("Arial", sp(9), QFont.Bold))
+        yes_btn.setCursor(Qt.PointingHandCursor)
+        yes_icon = QPixmap(str(RESOURCES_DIR / "logout white.png"))
+        if not yes_icon.isNull():
+            yes_btn.setIcon(QIcon(yes_icon))
+        yes_btn.setIconSize(QSize(sp(14), sp(14)))
+        yes_btn.setLayoutDirection(Qt.RightToLeft)   # icon on the right, like screenshot
+        yes_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #d32f2f;
+                border: none;
+                color: white;
+                border-radius: 6px;
+            }
+            QPushButton:hover { background-color: #b71c1c; }
+        """)
+        yes_btn.clicked.connect(dlg.accept)
+
+        btn_row.addWidget(no_btn)
+        btn_row.addWidget(yes_btn)
+        main.addLayout(btn_row)
+
+        if dlg.exec_() == QDialog.Accepted:
+            self.logout_requested.emit()     # ← just emit, let HALApplication handle it
             self.close()
 
+    def worker_ch3_5v(self):
+        self.psu_send_command("*CLS")
+        self.psu_send_command("INST:NSEL 3")
+        time.sleep(0.1)
 
+        self.psu_send_command("SOUR3:VOLT 5.0")
+        self.psu_send_command("SOUR3:CURR 0.5")
 
-
-
-
+        self.psu_send_command("OUTP ON")
+        time.sleep(0.5)   # ⏳ let PSU settle
+        self.start_voltage_monitoring()
+        self.current_channel = 3
+        self.log_signal.emit("Ch3 OUTPUT ON (5V, 0.5A)", False)
     def start_retry_cycle(self):
         self.connection_in_progress = True
         self.logout_btn.setEnabled(True)
@@ -247,6 +372,8 @@ class ConnectionScreen(QMainWindow):
 
 
     def start_actual_connection(self):
+        if self.worker:
+            self.worker.reset()
         self.worker = ConnectionWorker()
         self.worker.log_signal.connect(self.append_log)
         self.worker.connection_complete.connect(self.on_connection_complete)
@@ -319,11 +446,11 @@ class ConnectionScreen(QMainWindow):
 
 
         self.log_text.setTextColor(QColor("#333"))
-
+    
     def on_connection_complete(self, success):
         self.connection_in_progress = False
         self.connect_btn.setEnabled(True)
-        self.logout_btn.setEnabled(False)
+        self.logout_btn.setEnabled(not success)
         self.connect_btn.setText("CONNECT")
         
         # Store oscilloscope connection reference for future use
@@ -337,25 +464,37 @@ class ConnectionScreen(QMainWindow):
             self.log_text.append("All devices connected successfully")
             self.logger.log("All devices connected successfully", False)
             self.connection_successful = True
-            QTimer.singleShot(1500, self.proceed_to_test_selection)
+            QTimer.singleShot(300, self.test_selection_requested.emit)
         else:
             self.view_logs_btn.setVisible(True)
             self.print_logs_btn.setVisible(True)
             self.log_text.setTextColor(QColor("#d32f2f"))
             self.log_text.append("Connection failed. Retrying…")
             self.start_retry_cycle()
+    def closeEvent(self, event):
+        try:
+            if self.worker and self.worker.isRunning():
+                self.worker.quit()
+                self.worker.wait()
+        except Exception as e:
+            print("Error stopping worker:", e)
 
+        event.accept()
 
 
     def proceed_to_test_selection(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.quit()
+            # Don't call wait() — let it finish in background
         self.test_selection_requested.emit()
-        self.hide()
+        self.close()
         
 
     def show_detailed_logs(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("Detailed Connection Logs")
-        dlg.setMinimumSize(700, 500)
+        size = responsive_size(0.45, 0.65, min_w=600, min_h=450, max_w=950, max_h=800)
+        dlg.setMinimumSize(size)
         dlg.setStyleSheet("""
             QDialog {
                 background-color: #ffffff;
@@ -368,7 +507,7 @@ class ConnectionScreen(QMainWindow):
 
         # ===== TITLE =====
         title = QLabel("Connection Log Details")
-        title.setFont(QFont("Arial", 14, QFont.Bold))
+        title.setFont(QFont("Arial", sp(14), QFont.Bold))
         title.setStyleSheet("color: #1a5da8;")
         title.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(title)
@@ -379,7 +518,7 @@ class ConnectionScreen(QMainWindow):
             <b>Connection Time:</b> {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}
             """
         )
-        meta.setStyleSheet("color:#374151; font-size:10pt;")
+        meta.setStyleSheet(f"color:#374151; font-size:{sp(10)}pt;")
         meta.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(meta)
 
@@ -387,7 +526,7 @@ class ConnectionScreen(QMainWindow):
         # ===== LOG VIEW (SCROLLABLE) =====
         log_view = QTextEdit()
         log_view.setReadOnly(True)
-        log_view.setFont(QFont("Consolas", 10))
+        log_view.setFont(QFont("Consolas", sp(10)))
         log_view.setStyleSheet("""
             QTextEdit {
                 border: 1px solid #d0d7e2;
@@ -445,8 +584,8 @@ class ConnectionScreen(QMainWindow):
         btn_row.addStretch()
 
         close_btn = QPushButton("Close")
-        close_btn.setFixedSize(100, 36)
-        close_btn.setFont(QFont("Arial", 9, QFont.Bold))
+        close_btn.setFixedSize(sp(100), sp(36))
+        close_btn.setFont(QFont("Arial", sp(9), QFont.Bold))
         close_btn.setStyleSheet("""
             QPushButton {
                 background-color: #1a5da8;
@@ -482,7 +621,8 @@ class ConnectionScreen(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle("Success")
         dlg.setModal(True)
-        dlg.resize(420, 240)   # bigger window
+        size = responsive_size(0.22, 0.22, min_w=380, min_h=220, max_w=550, max_h=320)
+        dlg.resize(size)   # bigger window
         dlg.setStyleSheet("""
             QDialog{
                 background:#f2f2f2;
@@ -501,14 +641,14 @@ class ConnectionScreen(QMainWindow):
         # ===== ICON =====
         icon = QLabel("✔")
         icon.setAlignment(Qt.AlignCenter)
-        icon.setFont(QFont("Segoe UI", 34, QFont.Bold))
+        icon.setFont(QFont("Segoe UI", sp(34), QFont.Bold))
         icon.setStyleSheet("color:#22c55e; border:none;")
         main.addWidget(icon)
 
         # ===== TITLE =====
         title = QLabel("Success")
         title.setAlignment(Qt.AlignCenter)
-        title.setFont(QFont("Segoe UI", 18, QFont.Bold))
+        title.setFont(QFont("Segoe UI", sp(18), QFont.Bold))
         title.setStyleSheet("color:#1a5da8; border:none;")
         main.addWidget(title)
 
@@ -516,7 +656,7 @@ class ConnectionScreen(QMainWindow):
         msg = QLabel(message)
         msg.setWordWrap(True)
         msg.setAlignment(Qt.AlignCenter)
-        msg.setFont(QFont("Segoe UI", 12))
+        msg.setFont(QFont("Segoe UI", sp(12)))
         msg.setStyleSheet("color:#333; border:none;")
         main.addWidget(msg)
 
@@ -524,7 +664,7 @@ class ConnectionScreen(QMainWindow):
 
         # ===== BUTTON =====
         ok = QPushButton("OK")
-        ok.setFixedHeight(40)
+        ok.setFixedHeight(sp(40))
         ok.setCursor(Qt.PointingHandCursor)
         ok.setStyleSheet("""
             QPushButton{
@@ -542,30 +682,6 @@ class ConnectionScreen(QMainWindow):
         main.addWidget(ok, alignment=Qt.AlignCenter)
 
         dlg.exec_()
-
-
-
-
-
-    # ===== RETURN TO LOGIN SCREEN =====
-    def confirm_logout(self, dialog):
-        dialog.accept()
-
-        from screens.login_screen import LoginScreen
-
-        self.login_screen = LoginScreen()
-        self.login_screen.show()
-
-        # 🔥 IMPORTANT: reconnect login flow again
-        self.login_screen.login_success.connect(self.reopen_connection_screen)
-
-        self.close()
-        
-    def reopen_connection_screen(self, name, emp_id, role):
-        # reopen connection screen after logout login
-        self.new_connection = ConnectionScreen(name, emp_id)
-        self.new_connection.show()
-        self.login_screen.close()
 
 
 

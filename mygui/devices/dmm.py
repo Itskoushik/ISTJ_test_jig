@@ -1,7 +1,5 @@
 import pyvisa
 
-import pyvisa
-
 def discover_dmm():
     """
     Detect ANY Rigol DMM and return details + connection

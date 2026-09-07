@@ -2,6 +2,12 @@ from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButt
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import Qt
 
+class _SpaceSafeButton(QPushButton):
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Space:
+            event.ignore()
+            return
+        super().keyPressEvent(event)
 
 class AbortTestConfirmationPopup(QDialog):
     def __init__(self, parent=None):
@@ -44,11 +50,14 @@ class AbortTestConfirmationPopup(QDialog):
         button_layout = QHBoxLayout()
         button_layout.setSpacing(12)
 
-        abort_go_back_btn = QPushButton("Yes, Abort & Go Back")
-        abort_go_back_btn.setMinimumHeight(36)
-        abort_go_back_btn.setMinimumWidth(140)
-        abort_go_back_btn.setFont(QFont("Arial", 10, QFont.Bold))
-        abort_go_back_btn.setStyleSheet("""
+        self.abort_go_back_btn = _SpaceSafeButton("Yes, Abort & Go Back")
+        self.abort_go_back_btn.setMinimumHeight(36)
+        self.abort_go_back_btn.setMinimumWidth(140)
+        self.abort_go_back_btn.setFont(QFont("Arial", 10, QFont.Bold))
+        self.abort_go_back_btn.setFocusPolicy(Qt.StrongFocus)
+        self.abort_go_back_btn.setAutoDefault(False)
+        self.abort_go_back_btn.setDefault(False)
+        self.abort_go_back_btn.setStyleSheet("""
             QPushButton {
                 background-color: #d32f2f;
                 color: white;
@@ -60,14 +69,17 @@ class AbortTestConfirmationPopup(QDialog):
                 background-color: #b71c1c;
             }
         """)
-        abort_go_back_btn.clicked.connect(self.accept)
-        button_layout.addWidget(abort_go_back_btn)
+        self.abort_go_back_btn.clicked.connect(self.accept)
+        button_layout.addWidget(self.abort_go_back_btn)
 
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setMinimumHeight(36)
-        cancel_btn.setMinimumWidth(100)
-        cancel_btn.setFont(QFont("Arial", 10, QFont.Bold))
-        cancel_btn.setStyleSheet("""
+        self.cancel_btn = _SpaceSafeButton("Cancel")
+        self.cancel_btn.setMinimumHeight(36)
+        self.cancel_btn.setMinimumWidth(100)
+        self.cancel_btn.setFont(QFont("Arial", 10, QFont.Bold))
+        self.cancel_btn.setFocusPolicy(Qt.StrongFocus)
+        self.cancel_btn.setAutoDefault(True)
+        self.cancel_btn.setDefault(True)
+        self.cancel_btn.setStyleSheet("""
             QPushButton {
                 background-color: #757575;
                 color: white;
@@ -79,7 +91,8 @@ class AbortTestConfirmationPopup(QDialog):
                 background-color: #616161;
             }
         """)
-        cancel_btn.clicked.connect(self.reject)
-        button_layout.addWidget(cancel_btn)
+        self.cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(self.cancel_btn)
 
         layout.addLayout(button_layout)
+        self.cancel_btn.setFocus()

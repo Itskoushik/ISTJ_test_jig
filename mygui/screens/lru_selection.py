@@ -17,6 +17,7 @@ class Singletestselection(QMainWindow):
         """Initialize the main UI"""
         # Window configuration
         self.setWindowTitle("LRU Selection Interface")
+        self.setWindowIcon(QIcon(str(RESOURCES_DIR / "istj.png")))
         # self.setGeometry(0, 0, 800, 700)
         self.setFixedSize(900, 650)
         
