@@ -185,7 +185,7 @@ def run_stby(screen):
     screen.operator_event.clear()
     screen.show_popup_signal.emit(
         "⚠ Operator Action Required",
-        "• Connect the headset jack J28 using headset adapter\n"
+        "• Connect the headset jack 1 using headset adapter\n"
         "• Turn the MIC MODE knob CCW\n",
         RESOURCES_DIR / "knob_headset.jpg","ok",None
     )
@@ -194,7 +194,7 @@ def run_stby(screen):
     screen.operator_event.wait()
     
     time.sleep(2)
-    screen.log_signal.emit("Headset jack J28 connected using headset adapter", False)
+    screen.log_signal.emit("Headset jack 1 connected using headset adapter", False)
     screen.log_signal.emit("Turned MIC MODE knob CCW", False)
     
     # 🛑 PAUSE POINT
@@ -222,7 +222,7 @@ def run_stby(screen):
     write_excel("F19",result)     # PASS
     
     
-    screen.log_signal.emit("Disconnecting J28 Headset jack.", False)
+    screen.log_signal.emit("Disconnecting Headset jack 1", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
     
     # 🛑 PAUSE POINT
@@ -230,14 +230,14 @@ def run_stby(screen):
     screen.operator_event.clear()
     screen.show_popup_signal.emit(
         "⚠ Operator Action Required",
-        "• Disconnect the headset jack J28 using headset adapter\n",
+        "• Disconnect the headset jack 1 using headset adapter\n",
         RESOURCES_DIR / "headset_rem.jpg","ok",None
     )
 
     # ⏸ WAIT until operator clicks OK
     screen.operator_event.wait()
     screen.check_abort()
-    screen.log_signal.emit("J28 headset jack successfully disconnected", False)
+    screen.log_signal.emit("Headset jack 1 successfully disconnected", False)
     time.sleep(2)
     set_ch1_ch2_scale_10v(screen)
 
@@ -535,7 +535,7 @@ def run_norm(screen):
     screen.operator_event.clear()
     screen.show_popup_signal.emit(
         "⚠ Operator Action Required",
-        "• Connect the headset jack J28 using headset adapter\n"
+        "• Connect the headset jack 1 using headset adapter\n"
         "• Turn the MIC MODE knob CCW\n",
         RESOURCES_DIR / "knob_headset.jpg","ok",None
     )
@@ -544,7 +544,7 @@ def run_norm(screen):
     screen.operator_event.wait()
     screen.check_abort()
     time.sleep(2)
-    screen.log_signal.emit("Headset jack J28 connected using headset adapter", False)
+    screen.log_signal.emit("Headset jack 1 connected using headset adapter", False)
     screen.log_signal.emit("Turned MIC MODE knob CCW", False)
     
     
@@ -573,7 +573,7 @@ def run_norm(screen):
     write_excel("F18",result)     # PASS
     
     time.sleep(1)
-    screen.log_signal.emit("Disconnecting J28 Headset jack.", False)
+    screen.log_signal.emit("Disconnecting Headset jack 1", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
     screen.check_abort()
     # 🛑 PAUSE POINT
@@ -581,14 +581,14 @@ def run_norm(screen):
     screen.operator_event.clear()
     screen.show_popup_signal.emit(
         "⚠ Operator Action Required",
-        "• Disconnect the headset jack J28 using headset adapter\n",
+        "• Disconnect the headset jack 1 using headset adapter\n",
         RESOURCES_DIR / "headset_rem.jpg","ok",None
     )
 
     # ⏸ WAIT until operator clicks OK
     screen.operator_event.wait()
     screen.check_abort()
-    screen.log_signal.emit("J28 headset jack successfully disconnected", False)
+    screen.log_signal.emit("Headset jack 1 successfully disconnected", False)
     time.sleep(2)
     set_ch1_ch2_scale_10v(screen)
     

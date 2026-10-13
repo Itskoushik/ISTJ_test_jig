@@ -26,6 +26,7 @@ CALIBRATION_REPORTS_DIR = REPORTS_DIR / "calibration_reports"
 PDF_TEST_REPORTS_DIR   = REPORTS_DIR / "pdfs"
 SELF_TEST_REPORTS_DIR  = REPORTS_DIR / "self-test-reports"
 EXCEL_TEST_REPORTS_DIR = REPORTS_DIR / "xl"
+EQUIPMENT_CHECK_LOGS_DIR = BASE_DIR / "logs" / "equipment_check_logs"
 
 
 # ── Calibration report sub-dirs (mirrors REPORTS_DIR structure) ──
@@ -49,7 +50,7 @@ def _set_hidden(path: Path) -> None:
 
 
 # Only create writable dirs — ADMIN_DIR is created by the installer
-for d in [LOGS_DIR, TEST_LOGS_DIR, CALIBRATION_LOGS_DIR, LOGS_DETAILED_DIR, LOGS_PDF_DIR,
+for d in [LOGS_DIR, TEST_LOGS_DIR, CALIBRATION_LOGS_DIR, EQUIPMENT_CHECK_LOGS_DIR, LOGS_DETAILED_DIR, LOGS_PDF_DIR,
           LOGS_SELF_TEST_DIR, REPORTS_DIR, CALIBRATION_REPORTS_DIR, PDF_TEST_REPORTS_DIR, SELF_TEST_REPORTS_DIR, EXCEL_TEST_REPORTS_DIR,
           EXCEL_CALIBRATION_REPORTS_DIR, PDF_CALIBRATION_REPORTS_DIR]:
     d.mkdir(parents=True, exist_ok=True)

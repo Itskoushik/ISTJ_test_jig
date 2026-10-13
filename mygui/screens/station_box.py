@@ -502,16 +502,24 @@ class StationBoxUI(QMainWindow):
 
         print("Selected tests:", selected_tests)
 
+        old = getattr(self, "single_test", None)
+        if old is not None:
+            try:
+                old._stop_all_background_threads()
+            except Exception:
+                pass
+
         self.single_test = SingleTestScreen(
-        selected_tests=selected_tests,
-        previous_screen=self,
-        entry_mode="station"
-          )
-        
-        # ✅ Register with HALApplication so eventFilter can see it
+            selected_tests=selected_tests,
+            previous_screen=self,
+            entry_mode="station"
+        )
+
         app = QApplication.instance()
         if hasattr(app, "current_screen"):
             app.current_screen = self.single_test
+        if hasattr(app, "on_disconnect_return"):
+            self.single_test.return_to_connection.connect(app.on_disconnect_return)
         self.single_test.show()
 
         self.close()

@@ -55,7 +55,13 @@ class PSUAutomation:
         self.host = host
 
         self.psu_lock = Lock()
-        self.rm = pyvisa.ResourceManager()
+        # Lazy — a ResourceManager is only opened if find_psu() is actually
+        # called (i.e. no existing PSU handle could be borrowed from
+        # DeviceMonitor). The normal/happy path borrows the live handle and
+        # never touches VISA discovery at all, so eagerly opening one here
+        # on every SelfTestWorker instantiation just leaked a VISA session
+        # per self-test click for no reason.
+        self.rm = None
         self.psu_inst = None
 
         self.current_channel = None
@@ -149,6 +155,8 @@ class PSUAutomation:
         self.host.log("PSU front panel UNLOCKED (SYST:LOCK OFF)", False)
 
     def find_psu(self):
+        if self.rm is None:
+            self.rm = pyvisa.ResourceManager()
         return find_psu(self)
 
     # ------------------------------------------------------------------
@@ -249,13 +257,8 @@ class PSUAutomation:
                 pass
             self.psu_inst = None
 
-            try:
-                if self.rm:
-                    self.rm.close()
-            except Exception:
-                pass
-            finally:
-                self.rm = None
+            # rm.close() is process-wide: it kills DMM, scope and DeviceMonitor sessions too
+            self.rm = None
 
             saved_channel = self.current_channel or 1
             self.host.notify_disconnect_toast()

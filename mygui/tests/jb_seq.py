@@ -69,7 +69,7 @@ def _relay_reset(screen):
 # ---------------------------------------------------------------------------
 # User tests — NORM for one connector
 # ---------------------------------------------------------------------------
-def _run_user_norm(screen, connector):
+def _run_user_norm(screen, connector, include_ps=True):
     col_off, cvr_on, cvr_off, cvr_label, tx_row, rx_row = _CONNECTOR_META[connector]
 
     # Set column context
@@ -79,9 +79,10 @@ def _run_user_norm(screen, connector):
         next_column(col_off)
 
     screen.check_abort()
-    power_supply.run_norm(screen)
-    time.sleep(1)
-    screen.check_abort()
+    if include_ps:
+        power_supply.run_norm(screen)
+        time.sleep(1)
+        screen.check_abort()
 
     screen.log_signal.emit("==========Commencing User Primary Intercom Channel test===========", False)
     user_primary_ics_vol.run_norm(screen)
@@ -159,7 +160,7 @@ def _run_user_norm(screen, connector):
 # ---------------------------------------------------------------------------
 # User tests — STBY for one connector
 # ---------------------------------------------------------------------------
-def _run_user_stby(screen, connector):
+def _run_user_stby(screen, connector, include_ps=True):
     col_off, cvr_on, cvr_off, cvr_label, tx_row, rx_row = _CONNECTOR_META[connector]
 
     # Set column context
@@ -169,9 +170,10 @@ def _run_user_stby(screen, connector):
         next_column(col_off)
 
     screen.check_abort()
-    power_supply.run_stby(screen)
-    time.sleep(1)
-    screen.check_abort()
+    if include_ps:
+        power_supply.run_stby(screen)
+        time.sleep(1)
+        screen.check_abort()
 
     screen.log_signal.emit("==========Commencing User Primary Intercom Channel test===========", False)
     user_primary_ics_vol.run_stby(screen)
@@ -320,18 +322,16 @@ def _run_ground_crew_stby(screen, row_offset=0):
 # Public entry point
 # ---------------------------------------------------------------------------
 def run_norm(screen):
+
     """
-    Full test sequence. For each connector in order:
-      1. Connect popup
-      2. box_init NORM
-      3. User tests NORM
-      4. Relay reset
-      5. box_init STBY
-      6. User tests STBY
-      7. [J103 only] Ground crew NORM then STBY (cable stays on J103)
-      8. Disconnect popup
-      9. Relay reset
+    Full test sequence.
+    Phase 1 (J103): connect → power supply (NORM+STBY, once) → ground crew
+      SS OFF (NORM+STBY) → ground crew SS ON (NORM+STBY) → J103 user tests
+      NORM+STBY (no PS) → disconnect.
+    Phase 2 (J104-J107): connect → box_init NORM → PS + user NORM →
+      relay reset → box_init STBY → PS + user STBY → disconnect.
     """
+
     reset_column_offset()
     reset_row_offset()
 
@@ -354,7 +354,26 @@ def run_norm(screen):
     time.sleep(1)
     screen.check_abort()
 
+    # ── POWER SUPPLY (once, J103) ──
+    reset_row_offset()
+    reset_column_offset()
+    box_init.run_init_jbox(screen)
+    time.sleep(1)
+    power_supply.run_norm(screen)
+    time.sleep(1)
+    screen.check_abort()
+
+    _relay_reset(screen)
+    box_init.run_init_jbox_stby(screen)
+    time.sleep(1)
+    reset_row_offset()
+    reset_column_offset()
+    power_supply.run_stby(screen)
+    time.sleep(1)
+    screen.check_abort()
+
     # ── SS OFF (R1) ──
+    _relay_reset(screen)
     box_init.run_init_jbox(screen)
     time.sleep(1)
     screen.log_signal.emit("==========GROUND CREW TESTS — NORMAL MODE (SS OFF)==========", False)
@@ -393,6 +412,23 @@ def run_norm(screen):
     _run_ground_crew_stby(screen, row_offset=44)
     screen.log_signal.emit("==========COMPLETED GROUND CREW TESTS IN STANDBY MODE (SS ON)==========", False)
 
+    # ── J103 USER TESTS (cable still on J103, PS already done) ──
+    screen.log_signal.emit(f"========== CONNECTOR {first_connector} ==========", False)
+
+    _relay_reset(screen)
+    box_init.run_init_jbox(screen)
+    time.sleep(1)
+    screen.log_signal.emit(f"==========COMMENCING NORMAL MODE — {first_connector}==========", False)
+    _run_user_norm(screen, first_connector, include_ps=False)
+    screen.log_signal.emit(f"==========COMPLETED NORMAL MODE — {first_connector}==========", False)
+
+    _relay_reset(screen)
+    box_init.run_init_jbox_stby(screen)
+    time.sleep(1)
+    screen.log_signal.emit(f"==========COMMENCING STANDBY MODE — {first_connector}==========", False)
+    _run_user_stby(screen, first_connector, include_ps=False)
+    screen.log_signal.emit(f"==========COMPLETED STANDBY MODE — {first_connector}==========", False)
+
     _relay_reset(screen)
     screen.check_abort()
     screen.operator_event.clear()
@@ -408,7 +444,7 @@ def run_norm(screen):
     # ══════════════════════════════════════════
     #  CONNECTOR LOOP — NORM/STBY user tests only
     # ══════════════════════════════════════════
-    for connector in _CONNECTOR_ORDER:
+    for connector in _CONNECTOR_ORDER[1:]:
         screen.log_signal.emit(f"========== CONNECTOR {connector} ==========", False)
 
         _relay_reset(screen)

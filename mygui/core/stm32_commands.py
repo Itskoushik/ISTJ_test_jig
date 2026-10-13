@@ -54,48 +54,144 @@ class RelayStateTracker:
             cls._relay_states.clear()
             cls._order.clear()
 
+    # Names of relay groups that failed on the most recent restore_all()
+    # call — callers (e.g. the screen's log line) can read this to tell
+    # the operator exactly what to check instead of a generic warning.
+    last_restore_failures: list = []
+
     @classmethod
-    def restore_all(cls) -> bool:
-        """
-        Send set_default_states first, then re-send every relay's last
-        commanded non-default state. Returns True only if every command
-        succeeds.
-        """
+    def restore_all(cls, screen=None, delay: float = 0.2) -> bool:
+        def _log(msg, err=False):
+            if screen is not None:
+                screen.log_signal.emit(msg, err)
+            else:
+                print(f"[RELAY RESTORE] {msg}")
+
+        cls.last_restore_failures = []
+
         with cls._lock:
             snapshot = [(group, *cls._relay_states[group]) for group in cls._order]
 
-        # Step 1 — default state
-        if not STM32RelayController.send_with_retry(STM32RelayController.set_default_states):
+        expected = len(snapshot)
+        if expected == 0:
+            _log("No saved relay state to restore.", False)
+            return True
+
+        if STM32RelayController._cached_port is None:
+            _log("No cached ISTJ CONTROLLER port yet — rescanning…", False)
+            port_found = False
+            for _ in range(5):
+                if STM32RelayController.sync():
+                    port_found = True
+                    break
+                time.sleep(1.0)
+            if not port_found:
+                _log("ISTJ CONTROLLER not found after rescanning — restore aborted.", True)
+                cls.last_restore_failures = ["ALL (ISTJ CONTROLLER not found)"]
+                return False
+
+        default_ok = STM32RelayController.send_with_retry(STM32RelayController.set_default_states)
+        if not default_ok:
+            _log("Default-state sweep failed — retrying once…", True)
+            time.sleep(0.5)
+            default_ok = STM32RelayController.send_with_retry(STM32RelayController.set_default_states)
+        if not default_ok:
+            _log("Default-state sweep failed after retry — restore aborted.", True)
+            cls.last_restore_failures = ["ALL (default-state sweep failed)"]
             return False
 
-        import time
         time.sleep(0.5)
+        print(f"[RELAY RESTORE] Relay snapshot contains {expected} active relay state(s).")
 
-        # Step 2 — re-apply last known state for every relay that had one
-        for group, fname, cmd_func in snapshot:
-            ok = STM32RelayController.send_with_retry(cmd_func)
-            if not ok:
-                print(f"[RELAY RESTORE] Failed to restore {group} ({fname})")
-                return False
-            time.sleep(0.2)
+        def _run_pass(items, pass_label):
+            still_failed = []
+            for i, (group, fname, cmd_func) in enumerate(items, 1):
+                ok = STM32RelayController.send_with_retry(cmd_func)
+                state_desc = fname.replace("set_", "").replace(f"{group}_", "").upper()
+                if ok:
+                    print(f"[RELAY RESTORE] [{i}/{len(items)}] Restoring {group.upper()} → {state_desc}")
+                else:
+                    print(f"[RELAY RESTORE] [{i}/{len(items)}]{pass_label} Failed to restore {group.upper()} → {state_desc}")
+                    still_failed.append((group, fname, cmd_func))
+                time.sleep(delay)
+            return still_failed
 
+        remaining = _run_pass(snapshot, "")
+        if remaining:
+            _log(f"Retrying {len(remaining)} relay(s) that didn't restore…", False)
+            time.sleep(0.5)
+            remaining = _run_pass(remaining, " (retry)")
+
+        cls.last_restore_failures = [group for group, _, _ in remaining]
+        restored = expected - len(remaining)
+
+        if cls.last_restore_failures:
+            _log(
+                f"Relay restoration incomplete: {restored}/{expected}. "
+                f"Failed: {', '.join(g.upper() for g in cls.last_restore_failures)}",
+                True,
+            )
+            return False
+
+        _log(f"✅ Relay restoration verified: {restored}/{expected}.", False)
         return True
+
+
     
 class STM32RelayController:
     """
-    Handles STM32 relay commands (S23, S31, Jxx, etc.)
+    Handles ISTJ CONTROLLER relay commands (S23, S31, Jxx, etc.)
     Uses CRC-8 (poly 0x07) – SAME logic as disconnect handshake
     """
 
     BAUDRATE = 115200
     TIMEOUT = 2
     RECEIVE_DEADLINE = 0.5             # extra time to assemble a full 8-byte frame
-    DEFAULT_RELAY_SETTLE_DELAY = 0.25   # pause after each successful default-state relay
-    _bus_lock = threading.Lock()       # serializes ALL STM32 serial transactions
+    _bus_lock = threading.Lock()       # serializes ALL ISTJ CONTROLLER serial transactions
+
+    # ── Cached last-known-good ISTJ CONTROLLER port, so routine sends skip the full
+    # OS device enumeration (serial.tools.list_ports.comports()) on every
+    # single relay command. Only re-scanned when the cached port fails.
+    _cached_port = None
+    # Set by sync() on its most recent attempt: True only when the port
+    # replied with zero bytes (not garbage, not "port not found"). That
+    # specific signature means the controller is alive and already synced,
+    # it just didn't re-ACK this probe — wait_until_ready() uses this to
+    # skip straight to relay restore instead of retrying sync() in a loop.
+    _last_sync_rx_empty = False
+
+    # ── Persistent connection used ONLY by set_default_states(), reused
+    # across every sweep for the entire app session. Opened once, never
+    # closed just because a sweep finished — that open/close per call was
+    # the source of the USB sound on every default-state reset. Only torn
+    # down if a real I/O exception proves the port is dead (5 consecutive
+    # relay failures, or an unexpected exception mid-sweep).
+    _default_state_conn = None
 
     # ── Relay-failure escalation state (Problems 1 & 4) ──
     _active_screen = None
     _relay_error_active = False
+
+    # ── Optional progress hook for set_default_states() (drives the
+    # "Switch Relays to Default" popup). Plain-Python callable so this
+    # module stays Qt-free: cb(event, *args) with events
+    #   "start"(total) "relay_start"(done, total, name)
+    #   "relay_done"(done, total, name, ok) "end"(failed_names) "abort"()
+    _default_progress_cb = None
+
+    @classmethod
+    def register_default_progress_callback(cls, cb):
+        cls._default_progress_cb = cb
+
+    @classmethod
+    def _emit_default_progress(cls, event, *args):
+        cb = cls._default_progress_cb
+        if cb is None:
+            return
+        try:
+            cb(event, *args)
+        except Exception as e:      # UI problems must NEVER break the relay sweep
+            print(f"[DEFAULT STATE] progress callback error ({event}): {e}")
 
     @classmethod
     def register_screen(cls, screen):
@@ -105,6 +201,70 @@ class STM32RelayController:
     def reset_relay_error_state(cls):
         cls._relay_error_active = False
 
+    @classmethod
+    def reset_bus_lock_if_stuck(cls):
+        """
+        A forcefully terminated worker thread may have been killed while
+        holding cls._bus_lock (e.g. mid relay-off sweep in set_default_states).
+        threading.Lock can't be force-released from outside the thread that
+        holds it, so if it's still locked after that thread is confirmed
+        dead, swap in a fresh one instead of letting every future relay
+        command hang forever. Only call this AFTER thread.wait() confirms
+        the owning thread has actually stopped.
+        """
+        try:
+            if cls._bus_lock.locked():
+                print("[RELAY] _bus_lock appeared stuck after forced stop — resetting it.")
+                cls._bus_lock = threading.Lock()
+                # Any serial handle the old holder had is untrusted now.
+                cls._default_state_conn = None
+                cls._cached_port = None
+        except Exception:
+            pass
+
+    @classmethod
+    def wait_until_ready(cls, max_attempts: int = 10, delay: float = 1.0, screen=None) -> str:
+        """
+        Establish a usable ISTJ CONTROLLER communication path after PSU reconnect.
+        Never raises. Returns one of:
+            "SYNC_CONFIRMED"        — sync() validated normally
+            "ALREADY_SYNCED"        — sync() didn't validate but the cached port
+                                    still answers a lightweight version probe
+            "CONTROLLER_UNAVAILABLE" — nothing worked after max_attempts
+        Only the final exhaustion is logged red; intermediate misses are informational.
+        """
+        def _log(msg, err=False):
+            if screen is not None:
+                screen.log_signal.emit(msg, err)
+            else:
+                print(f"[ISTJ READY] {msg}")
+
+        for attempt in range(1, max_attempts + 1):
+            if cls.sync():
+                _log("✅ ISTJ CONTROLLER sync confirmed after PSU restore", False)
+                return "SYNC_CONFIRMED"
+
+            # Empty reply (zero bytes, not garbage) on a port we already
+            # trust means the controller is alive and already synced — it
+            # just didn't re-ACK this probe. Go straight to relay restore
+            # instead of retrying sync() or paying for a get_device_info()
+            # round trip.
+            if cls._cached_port is not None and cls._last_sync_rx_empty:
+                _log("ℹ ISTJ CONTROLLER pre-synced (empty sync reply on known port).", False)
+                return "ALREADY_SYNCED"
+
+            # sync() didn't validate and the reply wasn't simply empty —
+            # fall back to an independent health probe before retrying.
+            if cls._cached_port is not None and cls.get_device_info() is not None:
+                _log("ℹ ISTJ CONTROLLER already synchronized / pre-synced.", False)
+                return "ALREADY_SYNCED"
+
+            if attempt < max_attempts:
+                _log(f"🔄 ISTJ CONTROLLER not ready yet — retrying... ({attempt}/{max_attempts})", False)
+                time.sleep(delay)
+
+        _log("❌ ISTJ CONTROLLER unavailable after recovery attempts.", True)
+        return "CONTROLLER_UNAVAILABLE"
     # ─── CRC-8 ────────────────────────────────────────────────────────────────
     @staticmethod
     def crc8(data) -> int:
@@ -130,6 +290,47 @@ class STM32RelayController:
                 ports.append(p)
         return ports
 
+    @classmethod
+    def _port_still_valid(cls, device: str) -> bool:
+        """
+        OS-level identity check only — no serial traffic, no _bus_lock.
+        Confirms the cached port still exists AND still looks like the
+        ISTJ (guards against Windows reassigning the same COM number to
+        an unrelated device). Never treated as proof of a live handshake.
+        """
+        for p in serial.tools.list_ports.comports():
+            if p.device != device:
+                continue
+            desc = p.description or ""
+            if any(k in desc for k in ["Bluetooth", "Wireless", "Intel", "Modem"]):
+                return False
+            return p.vid == 0x0483 or any(
+                k in desc for k in ["STM32", "ST-Link", "ISTJ", "USB Serial"]
+            )
+        return False  # not enumerated at all anymore
+
+    @classmethod
+    def get_cached_or_discover_port(cls) -> str | None:
+        """
+        SINGLE authoritative ISTJ port resolver (Req #8/#9). Every caller
+        that needs "the ISTJ COM port" — DeviceMonitor's screen-lifecycle
+        code included — goes through this, so there's exactly one cache
+        (_cached_port) instead of parallel unsynced ones.
+
+        Fast path : cached port still enumerated + still identity-matches
+                    → returned as-is, no enumeration of anything else.
+        Fallback  : cached port missing/invalid → full rescan, first
+                    ISTJ-identified port found is cached and returned.
+        """
+        if cls._cached_port and cls._port_still_valid(cls._cached_port):
+            return cls._cached_port
+
+        cls._cached_port = None
+        candidates = cls._get_stm32_ports()
+        if candidates:
+            cls._cached_port = candidates[0].device
+        return cls._cached_port
+
     # ─── Robust frame receiver ──────────────────────────────────────────────
     @classmethod
     def _read_exact_frame(cls, ser, expected_length: int = 8) -> bytes:
@@ -154,22 +355,19 @@ class STM32RelayController:
 
         return bytes(buffer)
 
-    # ─── Core send + validate ─────────────────────────────────────────────────
     @classmethod
     def send_and_validate(cls, cmd_byte: int, tx_state: int,
-                          expected_rx_state: int | None = None,
-                          _conn=None) -> bool:
+                          expected_rx_state: int | None = None) -> bool:
         """
         Build and send an 8-byte command frame, then validate the 8-byte reply.
 
         TX frame : 02 35 02 CMD TX_STATE CRC 03 0D
         RX frame : 02 07 02 CMD RX_STATE CRC 03 0D   (slave=0x07 in response)
 
-        `_conn` is internal-use only: when set_default_states() passes an
-        already-open serial.Serial, it's reused instead of opening/closing a
-        fresh connection for this one command. Do not pass this from
-        outside the class — every set_jXX_on/off()-style call keeps calling
-        this with only (cmd_byte, tx_state), unaffected.
+        Reuses the shared persistent connection (_default_state_conn) if
+        already open on the cached port — no open, no sound. Only opens
+        fresh (and keeps THAT open too) if there's no persistent connection
+        yet, or it just proved dead.
         """
         if expected_rx_state is None:
             expected_rx_state = tx_state
@@ -190,53 +388,64 @@ class STM32RelayController:
                 return False
             return True
 
-        with cls._bus_lock:
-            # ── Persistent-connection path (used by set_default_states) ──
-            if _conn is not None:
-                try:
-                    _conn.reset_input_buffer()
-                    _conn.write(tx)
-                    time.sleep(0.2)
-                    rx = cls._read_exact_frame(_conn, 8)
-                except Exception as e:
-                    print(f"[RELAY RX] Shared connection error for CMD=0x{cmd_byte:02X}: {e}")
-                    return False
+        def _try_port(port_device: str) -> bool:
+            try:
+                ser = serial.Serial(port_device, cls.BAUDRATE, timeout=0.05)
+                ser.reset_input_buffer()
+                ser.write(tx)
+                time.sleep(0.3)
+                rx = cls._read_exact_frame(ser, 8)
 
                 if len(rx) == 0:
-                    print(f"[RELAY RX] Empty response for CMD=0x{cmd_byte:02X} STATE=0x{tx_state:02X}")
+                    print(f"[RELAY RX] Empty response for CMD=0x{cmd_byte:02X} STATE=0x{tx_state:02X} on {port_device}")
+                    ser.close()
                     return False
                 if len(rx) != 8:
                     print(f"[RELAY RX] Partial response for CMD=0x{cmd_byte:02X}: "
-                          f"received {len(rx)}/8 bytes: {rx.hex(' ')}")
+                          f"received {len(rx)}/8 bytes on {port_device}: {rx.hex(' ')}")
+                    ser.close()
                     return False
-                return _validate(rx)
+                if not _validate(rx):
+                    ser.close()
+                    return False
 
-            # ── Legacy path: open/close per command (unchanged externally) ──
-            for port in cls._get_stm32_ports():
+                cls._default_state_conn = ser
+                return True
+
+            except Exception as e:
+                print(f"[RELAY TX] Exception on cached/candidate port {port_device}: {e}")
+                return False
+
+        with cls._bus_lock:
+            # ── Reuse the shared persistent connection if already open on
+            # the cached port — no open, no sound. ──
+            ser = cls._default_state_conn
+            if (cls._cached_port is not None and ser is not None
+                    and getattr(ser, "is_open", False)
+                    and getattr(ser, "port", None) == cls._cached_port):
+                if cls._send_on_open_conn(ser, cmd_byte, tx_state, expected_rx_state):
+                    return True
+                # Reused connection just failed — stop trusting it.
                 try:
-                    ser = serial.Serial(port.device, cls.BAUDRATE, timeout=cls.TIMEOUT)
-                    try:
-                        ser.reset_input_buffer()
-                        ser.write(tx)
-                        time.sleep(0.3)
-                        rx = cls._read_exact_frame(ser, 8)
-                    finally:
-                        ser.close()
-
-                    if len(rx) == 0:
-                        print(f"[RELAY RX] Empty response for CMD=0x{cmd_byte:02X} STATE=0x{tx_state:02X}")
-                        continue
-                    if len(rx) != 8:
-                        print(f"[RELAY RX] Partial response for CMD=0x{cmd_byte:02X}: "
-                              f"received {len(rx)}/8 bytes: {rx.hex(' ')}")
-                        continue
-
-                    if _validate(rx):
-                        return True
-                    continue
-
+                    ser.close()
                 except Exception:
-                    continue
+                    pass
+                cls._default_state_conn = None
+                cls._cached_port = None
+
+            # ── Fast path: try the cached port directly, no enumeration ──
+            if cls._cached_port is not None:
+                if _try_port(cls._cached_port):
+                    return True
+                cls._cached_port = None
+
+            # ── Slow path: only runs when there's no cached port yet, or the
+            # cached one just failed. This is the only place that still
+            # calls _get_stm32_ports() (i.e. comports() device enumeration).
+            for port in cls._get_stm32_ports():
+                if _try_port(port.device):
+                    cls._cached_port = port.device   # remember it for next call
+                    return True
 
             return False
 
@@ -244,7 +453,48 @@ class STM32RelayController:
     # (unchanged — send_with_retry, _psu_seems_down, _prompt_psu_recovery_or_abort,
     #  _handle_relay_command_failure, _prompt_retry_or_abort, _escalate all stay
     #  exactly as in the original file)
+    
+    @classmethod
+    def _send_on_open_conn(cls, ser, cmd_byte: int, tx_state: int,
+                            expected_rx_state: int | None = None) -> bool:
+        """
+        Same frame build + validate logic as send_and_validate(), but reuses
+        an already-open serial.Serial instead of opening/closing per call.
+        Caller is responsible for holding _bus_lock for the whole sweep and
+        for opening/closing `ser`.
+        """
+        if expected_rx_state is None:
+            expected_rx_state = tx_state
 
+        body = [0x02, 0x35, 0x02, cmd_byte, tx_state, 0x03, 0x0D]
+        body.insert(5, cls.crc8(body))
+        tx = bytearray(body)
+
+        try:
+            ser.reset_input_buffer()
+            ser.write(tx)
+            time.sleep(0.3)
+            rx = cls._read_exact_frame(ser, 8)
+        except Exception as e:
+            print(f"[RELAY TX] Write/read failed on persistent conn (CMD=0x{cmd_byte:02X}): {e}")
+            return False
+
+        if len(rx) != 8:
+            print(f"[RELAY RX] Bad length for CMD=0x{cmd_byte:02X}: {len(rx)}/8 bytes: {rx.hex(' ')}")
+            return False
+
+        start, slave, length, rc, rst, rcrc, end, eof = rx
+        if (start != 0x02 or slave != 0x07 or length != 0x02 or
+                rc != cmd_byte or rst != expected_rx_state or
+                end != 0x03 or eof != 0x0D):
+            print(f"[RELAY RX] Invalid frame for CMD=0x{cmd_byte:02X}: {rx.hex(' ')}")
+            return False
+        if cls.crc8([start, slave, length, rc, rst, end, eof]) != rcrc:
+            print(f"[RELAY RX] CRC failure for CMD=0x{cmd_byte:02X}: {rx.hex(' ')}")
+            return False
+        return True
+    
+    
     @classmethod
     def set_default_states(cls) -> bool:
 
@@ -261,7 +511,6 @@ class STM32RelayController:
         ("S17", 0x70), ("S18", 0x71), ("S19", 0x72),
 
         # ── Remaining relays ──
-        ("S21", 0x74), ("S22", 0x75), ("S23", 0x76), ("S24", 0x77), ("S25", 0x78),
         ("S26", 0x79), ("S27", 0x7A), ("S28", 0x7B), ("S29", 0x7C),
         ("S30", 0x7D), ("S31", 0x7E), ("S32", 0x7F), ("S33", 0x80),
         ("S34", 0x81), ("S35", 0x82), ("S36", 0x83),
@@ -274,75 +523,199 @@ class STM32RelayController:
         ("J49", 0x41), ("J50", 0x42), ("J51", 0x43), ("J52", 0x44),
         ("J53", 0x45), ("J54", 0x46),
         ("J67", 0x53), ("J68", 0x54),
-        ("J70", 0x56), ("J71", 0x57),
+        ("J70", 0x56), ("J71", 0x57),("S24", 0x77), ("S25", 0x78),("S23", 0x76),("S21", 0x74), ("S22", 0x75), 
     ]
 
-        ports = cls._get_stm32_ports()
-        if not ports:
-            print("[DEFAULT STATE] No STM32 port found for relay reset")
-            return False
-
-        # NOTE: Reverted the "persistent shared connection + pause listeners"
-        # approach. That pattern held one COM-port handle open continuously
-        # for the whole ~90-command sweep and paused the PSU/oscilloscope
-        # listeners around it. On this system's USB chipset (shared internal
-        # hub, fewer independent controllers than a normal desktop), holding
-        # the port open that long while suspending sibling VISA polling was
-        # destabilizing the PSU/scope connections — they came back as
-        # "disconnected" right after every relay reset. Reverting to
-        # per-command open/close (each relay command opens the COM port,
-        # writes, reads, and closes immediately) matches the version that
-        # was proven stable on this hardware, and the PSU/scope listeners
-        # are left running throughout instead of being paused.
+        # NOTE: Switched from per-command open/close (which caused ~90
+        # USB open/close cycles per sweep, showing up as repeated device
+        # detect/disconnect events) to a single persistent connection held
+        # open for the whole sweep. UNLIKE the earlier reverted attempt,
+        # this does NOT touch the PSU/oscilloscope listeners — they keep
+        # running exactly as before. Only the connection-per-command
+        # pattern changes; if this still destabilizes PSU/scope on this
+        # hardware, the listener-pausing was not the actual cause and this
+        # persistent-connection approach itself needs to be reverted.
         failed = []
         consecutive_fail_count = 0
+        recent_failed_batch = []   # (name, cmd) pairs for the CURRENT consecutive-fail streak
         RELAY_RETRIES = 3   # per-relay retries — one flaky send shouldn't count as a failure
-
-        for name, cmd in relay_off_commands:
-            relay_ok = False
-            for attempt in range(1, RELAY_RETRIES + 1):
-                if cls.send_and_validate(cmd, 0x00):   # no _conn — opens/closes per call
-                    relay_ok = True
-                    break
-                if attempt < RELAY_RETRIES:
-                    time.sleep(0.25)
-
-            if relay_ok:
-                if consecutive_fail_count:
-                    print(f"[DEFAULT STATE] {name} → OFF ✓ (recovered after {consecutive_fail_count} prior failures)")
-                else:
-                    print(f"[DEFAULT STATE] {name} → OFF ✓")
-                consecutive_fail_count = 0
-                time.sleep(cls.DEFAULT_RELAY_SETTLE_DELAY)  # let the bus settle
-            else:
-                failed.append(name)
-                consecutive_fail_count += 1
+        restart_sweep = False   # set True when operator chooses Retry — instead of limping
+                                 # through the remaining relays with a possibly-bad connection,
+                                 # bail out and re-run the ENTIRE sweep from scratch once the
+                                 # lock is released (recursive call below)
+        abort_requested = False # set True when operator chooses Abort — instead of raising
+                                 # immediately while still holding _bus_lock, break out cleanly
+                                 # and call abort_test_internal() directly once the lock is
+                                 # released, THEN raise to unwind the rest of the test flow
+        with cls._bus_lock:
+            # ── STRICT cache-only: NEVER enumerate COM ports / USB devices
+            # from this method. If nothing has been cached yet (no relay
+            # command or sync() has succeeded so far), fail fast instead of
+            # scanning — the cache gets populated by whichever
+            # send_and_validate() / _send_raw_and_check() call runs first
+            # elsewhere (e.g. STM32RelayController.sync() at test start).
+            port_device = cls._cached_port
+            if port_device is None:
                 print(
-                    f"[DEFAULT STATE] {name} failed after {RELAY_RETRIES} attempts "
-                    f"({consecutive_fail_count} consecutive real failures)"
+                    "[DEFAULT STATE] No cached ISTJ CONTROLLER port yet — skipping relay "
+                    "reset without scanning. Run sync() or any relay command "
+                    "first to establish the cached port."
                 )
+                return False
 
-                if consecutive_fail_count >= 5:
-                    print(
-                        "[DEFAULT STATE] 5 relays failed consecutively even after "
-                        "individual retries — this is USB/comms corruption, not a "
-                        "one-off blip. Stopping sweep and escalating."
-                    )
-                    cls._escalate(
-                        title="⚠ Relay Communication Failure",
-                        message=(
-                            "Relay communication has repeatedly failed.\n\n"
-                            "Possible causes:\n"
-                            "• ISTJ entered Bad Authentication mode.\n"
-                            "• USB communication corruption.\n\n"
-                            "Recommended Action:\n"
-                            "Abort the current test.\n"
-                            "Reconnect the ISTJ.\n"
-                            "Reconnect the USB cable.\n"
-                            "Restart the application."
-                        ),
-                    )
+            # ── Reuse the persistent connection if it's already open on the
+            # same port — no open, no sound. Only opens fresh if this is the
+            # very first sweep, or a previous sweep tore the connection down
+            # after a real failure.
+            ser = cls._default_state_conn
+            reused = (
+                ser is not None
+                and getattr(ser, "is_open", False)
+                and getattr(ser, "port", None) == port_device
+            )
+
+            if not reused:
+                try:
+                    ser = serial.Serial(port_device, cls.BAUDRATE, timeout=0.05)
+                    time.sleep(0.3)   # settle once, up front — not per command
+                    cls._default_state_conn = ser
+                except Exception as e:
+                    print(f"[DEFAULT STATE] Failed to open cached port {port_device}: {e}")
+                    cls._cached_port = None   # cached port no longer trustworthy
+                    cls._default_state_conn = None
                     return False
+
+            connection_broke = False
+            total_relays = len(relay_off_commands)
+            sweep_interrupted = False   # abort_event seen mid-sweep -> popup is hidden, not "finished"
+            cls._emit_default_progress("start", total_relays)
+            try:
+                for idx, (name, cmd) in enumerate(relay_off_commands):
+                    screen = cls._active_screen
+                    if screen is not None and screen.abort_event.is_set():
+                        print(f"[DEFAULT STATE] Abort detected mid-sweep — stopping early at {name}.")
+                        sweep_interrupted = True
+                        break
+                    cls._emit_default_progress("relay_start", idx, total_relays, name)
+                    relay_ok = False
+                    for attempt in range(1, RELAY_RETRIES + 1):
+                        if cls._send_on_open_conn(ser, cmd, 0x00):
+                            relay_ok = True
+                            break
+                        if attempt < RELAY_RETRIES:
+                            time.sleep(0.15)
+
+                    time.sleep(0.15)   # settle delay after every relay, success or fail
+                    cls._emit_default_progress("relay_done", idx + 1, total_relays, name, relay_ok)
+
+                    if relay_ok:
+                        if consecutive_fail_count:
+                            print(f"[DEFAULT STATE] {name} → OFF ✓ (recovered after {consecutive_fail_count} prior failures)")
+                        else:
+                            print(f"[DEFAULT STATE] {name} → OFF ✓")
+                        consecutive_fail_count = 0
+                        recent_failed_batch = []
+                    else:
+                        failed.append(name)
+                        consecutive_fail_count += 1
+                        recent_failed_batch.append((name, cmd))
+                        print(
+                            f"[DEFAULT STATE] {name} failed after {RELAY_RETRIES} attempts "
+                            f"({consecutive_fail_count} consecutive real failures)"
+                        )
+
+                        if consecutive_fail_count >= 5:
+                            print(
+                                "[DEFAULT STATE] 5 relays failed consecutively even after "
+                                "individual retries — pausing sweep to ask operator whether "
+                                "to retry or abort."
+                            )
+                            failed_names = [n for n, _ in recent_failed_batch]
+                            cls._emit_default_progress("pause")   # hide progress popup so it can't cover the prompt
+                            choice = cls._prompt_relay_reset_retry_or_abort(failed_names)
+
+                            if choice == "retry":
+                                print(
+                                    "[DEFAULT STATE] Operator chose to retry — re-running the "
+                                    "ENTIRE default-state sweep from the start (retrying just "
+                                    "the failed batch inline didn't hold up, so this restarts "
+                                    "clean instead of limping through the rest)."
+                                )
+                                restart_sweep = True
+                                # ── Force a fresh connection on the retry pass. The
+                                # persistent connection can still report is_open=True
+                                # even after the USB cable was unplugged/replugged —
+                                # reusing it silently kept writing into a dead handle,
+                                # which is why Retry appeared to do nothing and failed
+                                # instantly. Closing it here forces the recursive
+                                # set_default_states() call below to open the port fresh.
+                                connection_broke = True
+                                break
+                            else:
+                                print(
+                                    "[DEFAULT STATE] Operator chose to abort — will call "
+                                    "abort_test_internal() directly once _bus_lock is released."
+                                )
+                                abort_requested = True
+                                connection_broke = True
+                                break
+            except Exception:
+                connection_broke = True
+                cls._emit_default_progress("abort")
+                raise
+            finally:
+                # Do NOT close on every sweep — only if it just proved
+                # unreliable, so the next call is forced to reopen fresh.
+                if connection_broke:
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+                    cls._default_state_conn = None
+
+            # Sweep completed without escalating — this port is proven good,
+            # keep the cache in sync so send_and_validate() also benefits.
+            # Skip this if we're about to restart or abort: a restart
+            # re-establishes it on its own recursive pass, and on abort the
+            # port is untrusted anyway (connection_broke was set True, so
+            # _default_state_conn is already cleared by the finally above).
+            if not restart_sweep and not abort_requested:
+                cls._cached_port = port_device
+
+        # ── Operator chose Retry: re-run the whole sweep from scratch, now
+        # that _bus_lock has been released (can't recurse while holding it —
+        # the lock isn't reentrant). A short settle delay first, matching the
+        # gap set_default_states() already gives itself between STEP 1 and
+        # STEP 2 elsewhere in this file.
+        if restart_sweep:
+            time.sleep(0.3)
+            return cls.set_default_states()
+
+        # ── Operator chose Abort — go straight to abort_test_internal()
+        # instead of just setting abort_event and hoping the raised
+        # exception eventually unwinds into cleanup somewhere upstream.
+        # _bus_lock is free here, so this is safe to call directly.
+        # reset_relays=False: relay comms just proved unreliable, no point
+        # re-sweeping them now. Still raise afterward — abort_test_internal()
+        # only does cleanup, it doesn't stop execution on its own, so
+        # without the raise whatever called set_default_states() (e.g. a
+        # test stage function) would keep running against state
+        # abort_test_internal() just tore down (test_running=False,
+        # buttons re-enabled, config unlocked, etc.).
+        if abort_requested:
+            cls._emit_default_progress("abort")     # hide popup, operator chose Abort
+            screen = cls._active_screen
+            if screen is not None:
+                try:
+                    screen.abort_test_internal(reset_relays=False)
+                except Exception as e:
+                    print(f"[DEFAULT STATE] abort_test_internal() failed: {e}")
+            raise Exception("TEST_ABORTED_BY_USER")
+
+        if sweep_interrupted:
+            cls._emit_default_progress("abort")
+        else:
+            cls._emit_default_progress("end", list(failed))
 
         if failed:
             print(f"[DEFAULT STATE] Completed with failures: {failed}")
@@ -405,6 +778,363 @@ class STM32RelayController:
                 raise Exception("TEST_ABORTED_BY_USER")
 
             return success
+
+    @classmethod
+    def _prompt_relay_reset_retry_or_abort(cls, failed_names: list) -> str:
+        """
+        Called when set_default_states() hits 5 consecutive relay failures.
+        Pauses the sweep and asks the operator to retry just the relays that
+        failed, or abort the test. Never raises itself — caller (set_default_states)
+        decides what to do with the answer.
+        """
+        screen = cls._active_screen
+        if screen is None:
+            print(
+                "[RELAY WRAPPER] ❌ Escalation triggered but no screen is "
+                "registered — cannot pause/prompt. Defaulting to abort."
+            )
+            return "abort"
+
+        if getattr(screen, "_relay_error_active", False):
+            print("[RELAY WRAPPER] Escalation already active — suppressing duplicate popup.")
+            return "abort"
+
+        screen._relay_error_active = True
+        screen._skip_relay_reset_on_abort = True
+
+        unique_names = ", ".join(dict.fromkeys(failed_names))  # de-duped, order preserved
+
+        message = (
+            "<p style='font-size:11pt;'>Relay communication has been Interrupted"
+            f"for: <b>{unique_names}</b>.</p>"
+            "<p style='font-size:11pt;'>Possible causes:</p>"
+            "<p style='font-size:11pt;'>"
+            "&bull; ISTJ CONTROLLER entered Bad Authentication mode.<br>"
+            "&bull; USB communication corruption.<br>"
+            "&bull; The USB relay cable may have been disconnected."
+            "</p>"
+            "<p style='font-size:13pt; font-weight:bold; color:#b71c1c;'>Recommended Action:</p>"
+            "<p style='font-size:12pt;'>"
+            "Check that the ISTJ CONTROLLER / USB cable is firmly connected, then click "
+            "<b>Retry</b> to attempt the operation again.<br>"
+            "If the cable was actually disconnected, reconnect it first, then Retry.<br>"
+            "Click <b>Abort Test</b> to stop the test and restart the application."
+            "</p>"
+        )
+
+        ack_event = threading.Event()
+        choice = {"value": "abort"}
+
+        from PyQt5.QtWidgets import QDialog
+
+        def _on_result(result, popup):
+            choice["value"] = "retry" if result == QDialog.Accepted else "abort"
+            ack_event.set()
+
+        try:
+            screen._queue_popup(
+                "⚠ Relay Communication Interruption",
+                message,
+                None, "retry_abort", None,
+                callback=_on_result,
+            )
+        except Exception as e:
+            print(f"[RELAY WRAPPER] Failed to queue popup: {e}")
+            ack_event.set()
+
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            if ack_event.wait(timeout=0.5):
+                break
+            if screen.abort_event.is_set():
+                print("[RELAY WRAPPER] Abort already in progress — skipping popup wait.")
+                break
+        screen._relay_error_active = False
+
+        if choice["value"] != "retry":
+            screen.abort_event.set()   # ← ensure this actually stops the test,
+                                        #   not just this one raised exception
+            return "abort"
+
+        screen._skip_relay_reset_on_abort = False
+        return "retry"
+
+    @classmethod
+    def send_with_retry_self_test(cls, cmd_func, retries: int = 3) -> bool:
+        """
+        (docstring unchanged)
+        """
+        empty_sync_retries = 0
+        MAX_EMPTY_SYNC_RETRIES = 1   # one more try, then accept as already-synced
+
+        while True:
+            success = False
+            for _ in range(retries):
+                if cmd_func():
+                    success = True
+                    break
+                time.sleep(0.3)
+
+            fname = getattr(cmd_func, "__name__", "") if callable(cmd_func) else ""
+            is_relay_cmd = fname.startswith("set_") and fname != "set_default_states"
+
+            if is_relay_cmd and success:
+                try:
+                    RelayStateTracker.record_state(fname, cmd_func)
+                except Exception:
+                    pass
+
+            if is_relay_cmd and not success:
+                choice = cls._handle_relay_failure_smart(fname)
+                screen = cls._active_screen
+
+                if choice == "benign":
+                    if empty_sync_retries < MAX_EMPTY_SYNC_RETRIES:
+                        empty_sync_retries += 1
+                        continue
+                    # Empty replies + CH3 ON: board already synced. Proceed.
+                    # send_and_validate() drops _cached_port on failure, so
+                    # restore it or set_default_states() will bail out.
+                    cls.get_cached_or_discover_port()
+                    if screen is not None:
+                        screen.log_signal.emit(
+                            f"ℹ {fname}: empty reply — ISTJ CONTROLLER already "
+                            "synced (benign), continuing.", False)
+                    try:
+                        RelayStateTracker.record_state(fname, cmd_func)
+                    except Exception:
+                        pass
+                    return True
+
+                if choice == "retry":
+                    if screen is not None:
+                        screen.log_signal.emit(f"🔁 Retrying {fname}…", False)
+                    continue
+
+                if screen is not None:
+                    screen._skip_relay_reset_on_abort = True
+                    screen.abort_event.set()
+                raise Exception("TEST_ABORTED_BY_USER")
+
+            return success
+
+    @classmethod
+    def _handle_relay_failure_smart(cls, fname: str) -> str:
+        """
+        Equipment-Self-Test-only recovery. See send_with_retry_self_test()
+        for the step order. Returns 'retry' or 'abort'. Never raises itself.
+        """
+        screen = cls._active_screen
+        if screen is None:
+            print("[RELAY WRAPPER][SELF TEST] ❌ Relay failure but no screen registered — defaulting to abort.")
+            return "abort"
+
+        if getattr(screen, "_relay_error_active", False):
+            print("[RELAY WRAPPER][SELF TEST] Escalation already active — suppressing duplicate popup.")
+            return "abort"
+
+        screen._relay_error_active = True
+        screen._skip_relay_reset_on_abort = True
+        screen._psu_ready_event.clear()
+
+        # ── Step 1: try sync() first, no popup yet ────────────────────
+        print(f"[RELAY RECOVERY][SELF TEST] {fname} failed — attempting sync() before escalating…")
+        if cls.sync():
+            print("[RELAY RECOVERY][SELF TEST] sync() succeeded — retrying relay command.")
+            screen._relay_error_active = False
+            screen._skip_relay_reset_on_abort = False
+            screen._psu_ready_event.set()
+            return "retry"
+
+        if cls._last_sync_rx_empty and cls._ch3_is_on(screen):
+            print("[RELAY RECOVERY][SELF TEST] sync() empty reply, CH3 ON — "
+                  "board already synced (benign).")
+            screen._relay_error_active = False
+            screen._skip_relay_reset_on_abort = False
+            screen._psu_ready_event.set()
+            return "benign"
+
+        # ── Step 2: no response at all — ISTJ USB / PSU CH3 / PSU power ──
+        print("[RELAY RECOVERY][SELF TEST] sync() got no response at all.")
+
+        ack_event = threading.Event()
+        choice = {"value": "abort"}
+        from PyQt5.QtWidgets import QDialog
+
+        def _on_result(result, popup):
+            choice["value"] = "retry" if result == QDialog.Accepted else "abort"
+            ack_event.set()
+
+        try:
+            screen._queue_popup(
+                "⚠ ISTJ CONTROLLER Not Responding",
+                f"The relay command ({fname}) failed, and the ISTJ CONTROLLER "
+                "is not responding.\n\n"
+                "This usually means one of the following:\n"
+                "  • The ISTJ CONTROLLER USB cable has been disconnected.\n"
+                "  • PSU Channel 3 (which powers the ISTJ board) has been "
+                "turned OFF.\n"
+                "  • The PSU itself has been disconnected or powered OFF.\n\n"
+                "Please check the ISTJ USB cable and the PSU, then click OK — "
+                "PSU Channel 3 will be restored, the ISTJ CONTROLLER will be "
+                "re-synced, and the command will be retried automatically.",
+                None, "ok", None,
+                callback=_on_result,
+            )
+        except Exception as e:
+            print(f"[RELAY WRAPPER][SELF TEST] Failed to queue popup: {e}")
+            ack_event.set()
+
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            if ack_event.wait(timeout=0.5):
+                break
+            if screen.abort_event.is_set():
+                print("[RELAY WRAPPER][SELF TEST] Abort already in progress — skipping popup wait.")
+                break
+
+        screen._relay_error_active = False
+
+        if screen.abort_event.is_set() or choice["value"] != "retry":
+            screen._psu_ready_event.set()
+            return "abort"
+
+        # ── Step 3: is the PSU itself reachable? ──────────────────────
+        psu = getattr(screen, "psu", None)
+        psu_alive = False
+        try:
+            if psu is not None and psu.psu_inst is not None:
+                with psu.psu_lock:
+                    psu.psu_inst.query("*IDN?")
+                psu_alive = True
+        except Exception:
+            psu_alive = False
+
+        if not psu_alive:
+            print("[RELAY RECOVERY][SELF TEST] PSU itself is unreachable — asking operator to check it.")
+            screen.log_signal.emit(
+                f"⚠ PSU unreachable during relay recovery for {fname}", True
+            )
+
+            psu_ack_event = threading.Event()
+
+            def _on_psu_ack(result, popup):
+                psu_ack_event.set()
+
+            try:
+                screen._queue_popup(
+                    "⚠ PSU Disconnected",
+                    "The PSU (Power Supply) could not be reached.\n\n"
+                    "Please check that:\n"
+                    "  • The PSU USB cable is firmly connected.\n"
+                    "  • The PSU power switch is turned ON.\n"
+                    "  • All power cables are properly seated.\n\n"
+                    "Click OK once the PSU is connected and powered on — "
+                    "reconnection will then be attempted automatically.",
+                    None, "ok", None,
+                    callback=_on_psu_ack,
+                )
+            except Exception as e:
+                print(f"[RELAY RECOVERY][SELF TEST] Failed to queue PSU popup: {e}")
+                psu_ack_event.set()
+
+            deadline = time.time() + 600
+            while time.time() < deadline:
+                if psu_ack_event.wait(timeout=0.5):
+                    break
+                if screen.abort_event.is_set():
+                    break
+
+            if screen.abort_event.is_set():
+                screen._psu_ready_event.set()
+                return "abort"
+
+            print("[RELAY RECOVERY][SELF TEST] Operator confirmed PSU checked — attempting PSU reconnect.")
+            screen.log_signal.emit("🔌 Attempting PSU reconnect…", False)
+            psu_ok = cls._reconnect_psu_for_relay_recovery_self_test(screen)
+            if not psu_ok:
+                screen.log_signal.emit(
+                    "❌ PSU reconnect failed. Check PSU power/cable and click OK to retry.", True
+                )
+                screen._psu_ready_event.set()
+                return cls._handle_relay_failure_smart(fname)   # loop back to Step 1
+
+        # ── Step 4: restore PSU Channel 3, re-sync, then retry ───────
+        print("[RELAY RECOVERY][SELF TEST] Restoring PSU Channel 3 and re-syncing…")
+        try:
+            if psu is not None:
+                psu.worker_ch3_5v()
+                time.sleep(1.0)
+        except Exception as e:
+            print(f"[RELAY RECOVERY][SELF TEST] PSU Channel 3 restore failed (non-fatal): {e}")
+
+        if cls.sync() or cls._last_sync_rx_empty:
+            print("[RELAY RECOVERY][SELF TEST] Re-sync succeeded — retrying relay command.")
+            screen._skip_relay_reset_on_abort = False
+            screen._psu_ready_event.set()
+            return "retry"
+
+        print("[RELAY RECOVERY][SELF TEST] Re-sync still failing — asking operator again.")
+        screen._psu_ready_event.set()
+        return cls._handle_relay_failure_smart(fname)   # loop back to Step 1
+    
+    
+    @classmethod
+    def _ch3_is_on(cls, screen) -> bool:
+        """True only if the PSU answers AND reports CH3 ON. Any failure -> False."""
+        try:
+            psu = getattr(screen, "psu", None)
+            if psu is None or psu.psu_inst is None:
+                return False
+            with psu.psu_lock:
+                st = psu.psu_inst.query("OUTP? CH3").strip().upper()
+            return st in ("1", "ON")
+        except Exception:
+            return False
+
+    @classmethod
+    def _reconnect_psu_for_relay_recovery_self_test(cls, screen, max_attempts: int = 5, delay: float = 3.0) -> bool:
+        """
+        Full PSU reconnect used only from _handle_relay_failure_smart()
+        above, for Equipment Self Test. Does not touch PSUAutomation's own
+        _background_reconnect() — runs synchronously here since the
+        operator is already blocked in this recovery flow.
+        """
+        psu = getattr(screen, "psu", None)
+        if psu is None:
+            return False
+
+        try:
+            if psu.psu_inst:
+                try:
+                    psu.psu_inst.close()
+                except Exception:
+                    pass
+            psu.psu_inst = None
+            psu.rm = None      # never rm.close(): it is process-wide
+        except Exception:
+            pass
+
+        import pyvisa as _pyvisa
+        for attempt in range(1, max_attempts + 1):
+            if screen.abort_event.is_set():
+                return False
+            print(f"[RELAY RECOVERY][SELF TEST] PSU reconnect attempt {attempt}/{max_attempts}…")
+            time.sleep(delay)
+            try:
+                psu.rm = _pyvisa.ResourceManager()
+                new_inst = psu.find_psu()
+                if not new_inst:
+                    continue
+                psu.psu_inst = new_inst
+                psu._safe_set_remote()
+                time.sleep(0.2)
+                screen.log_signal.emit("✅ PSU reconnected.", False)
+                return True
+            except Exception as e:
+                print(f"[RELAY RECOVERY][SELF TEST] PSU reconnect attempt {attempt} failed: {e}")
+
+        return False
 
     @classmethod
     def _psu_seems_down(cls, screen) -> bool:
@@ -514,13 +1244,13 @@ class STM32RelayController:
     def _handle_relay_command_failure(cls) -> str:
         """Returns 'retry' or 'abort' — does not raise itself."""
         return cls._prompt_retry_or_abort(
-            title="⚠ Relay Communication Failure",
+            title="⚠ Relay Communication Interruption",
             message=(
-                "Relay communication failed.\n\n"
+                "Relay communication interrupted.\n\n"
                 "Possible causes:\n"
                 "USB communication issue.\n"
                 "Bad relay connection.\n"
-                "STM32 communication failure."
+                "ISTJ CONTROLLER communication interruption."
             ),
         )
 
@@ -560,8 +1290,8 @@ class STM32RelayController:
         try:
             screen._queue_popup(
                 title,
-                message + "\n\nClick YES to retry this relay command, NO to abort the test.",
-                None, "yes_no", None,
+                message + "\n\nClick Retry to retry this relay command, Abort to stop the test.",
+                None, "retry_abort", None,
                 callback=_on_result,
             )
         except Exception as e:
@@ -1113,14 +1843,136 @@ class STM32RelayController:
     # Sync   TX: 02 35 02 FF 00 98 03 0D   RX: 02 35 02 FF 01 F3 03 0D
     @classmethod
     def sync(cls) -> bool:
+        """
+        Sync   TX: 02 35 02 FF 00 98 03 0D   RX: 02 35 02 FF 01 F3 03 0D
+
+        Reuses the persistent connection if it's already open on the cached
+        port — just re-sends the sync frame on it, no new open. Only opens
+        fresh if there's no live connection yet, or the reused one just failed.
+        """
         tx = bytearray([0x02, 0x35, 0x02, 0xFF, 0x00, 0x98, 0x03, 0x0D])
-        return cls._send_raw_and_check(tx, expected_cmd=0xFF, expected_state=0x01)
+
+        def _validate_sync(rx: bytes) -> bool:
+            if len(rx) != 8:
+                return False
+            start, slave, length, rc, rst, rcrc, end, eof = rx
+            if (start != 0x02 or slave != 0x35 or length != 0x02 or
+                    rc != 0xFF or rst != 0x01 or end != 0x03 or eof != 0x0D):
+                return False
+            return cls.crc8([start, slave, length, rc, rst, end, eof]) == rcrc
+
+        def _try_port(port_device: str) -> bool:
+            try:
+                ser = serial.Serial(port_device, cls.BAUDRATE, timeout=0.05)
+                ser.reset_input_buffer()
+                ser.write(tx)
+                time.sleep(0.4)
+                rx = cls._read_exact_frame(ser, 8)
+                cls._last_sync_rx_empty = (len(rx) == 0)
+                if not _validate_sync(rx):
+                    ser.close()
+                    return False
+                cls._default_state_conn = ser
+                return True
+            except Exception:
+                # Real transport/open failure — this is not the "empty
+                # reply from a known-good port" case, so don't leave a
+                # stale True from a previous call lying around.
+                cls._last_sync_rx_empty = False
+                return False
+
+        with cls._bus_lock:
+            # ── Reuse the persistent connection if it's already open — just
+            # re-send the sync frame on it, don't open a second handle. ──
+            ser = cls._default_state_conn
+            if (cls._cached_port is not None and ser is not None
+                    and getattr(ser, "is_open", False)
+                    and getattr(ser, "port", None) == cls._cached_port):
+                try:
+                    ser.reset_input_buffer()
+                    ser.write(tx)
+                    time.sleep(0.4)
+                    rx = cls._read_exact_frame(ser, 8)
+                    cls._last_sync_rx_empty = (len(rx) == 0)
+                    if _validate_sync(rx):
+                        return True
+                    if cls._last_sync_rx_empty:
+                        # Zero-byte reply on a port we already trust: the
+                        # controller is alive and pre-synced, it just didn't
+                        # re-ACK this probe. Keep _cached_port so
+                        # wait_until_ready()'s ALREADY_SYNCED shortcut can
+                        # use it — do NOT fall through to a full rescan.
+                        return False
+                except Exception:
+                    cls._last_sync_rx_empty = False
+                # Reused connection failed for a real reason (garbage reply
+                # or transport exception) — stop trusting it, fall through.
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                cls._default_state_conn = None
+                cls._cached_port = None
+
+            if cls._cached_port is not None:
+                if _try_port(cls._cached_port):
+                    return True
+                if cls._last_sync_rx_empty:
+                    # Same case as above but via the non-reused fast path:
+                    # cached port answered with zero bytes. Keep trusting
+                    # it instead of forcing a full USB rescan.
+                    return False
+                cls._cached_port = None
+
+            for port in cls._get_stm32_ports():
+                if _try_port(port.device):
+                    cls._cached_port = port.device
+                    return True
+
+            return False
  
     # Unsync TX: 02 35 02 FF E0 56 03 0D   RX: 02 35 02 FF E1 3D 03 0D
     @classmethod
     def unsync(cls) -> bool:
+        """
+        Unsync TX: 02 35 02 FF E0 56 03 0D   RX: 02 35 02 FF E1 3D 03 0D
+
+        Reuses the persistent connection if open, then actually closes it.
+        """
         tx = bytearray([0x02, 0x35, 0x02, 0xFF, 0xE0, 0x56, 0x03, 0x0D])
-        return cls._send_raw_and_check(tx, expected_cmd=0xFF, expected_state=0xE1)
+
+        with cls._bus_lock:
+            ser = cls._default_state_conn
+            reused = (
+                ser is not None
+                and getattr(ser, "is_open", False)
+                and getattr(ser, "port", None) == cls._cached_port
+            )
+
+            if reused:
+                result = False
+                try:
+                    ser.reset_input_buffer()
+                    ser.write(tx)
+                    time.sleep(0.4)
+                    rx = cls._read_exact_frame(ser, 8)
+                    if len(rx) == 8:
+                        start, slave, length, rc, rst, rcrc, end, eof = rx
+                        if (start == 0x02 and slave == 0x35 and length == 0x02 and
+                                rc == 0xFF and rst == 0xE1 and end == 0x03 and eof == 0x0D and
+                                cls.crc8([start, slave, length, rc, rst, end, eof]) == rcrc):
+                            result = True
+                except Exception:
+                    result = False
+
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                cls._default_state_conn = None
+                return result
+
+            return cls._send_raw_and_check(tx, expected_cmd=0xFF, expected_state=0xE1)
  
     # @classmethod
     # def set_default_states(cls) -> bool:
@@ -1155,7 +2007,7 @@ class STM32RelayController:
     # ]
  
     #     if not cls._get_stm32_ports():
-    #         print("[DEFAULT STATE] No STM32 port found for relay reset")
+    #         print("[DEFAULT STATE] No ISTJ CONTROLLER port found for relay reset")
     #         return False
 
     #     failed = []
@@ -1197,11 +2049,11 @@ class STM32RelayController:
     #                     message=(
     #                         "Relay communication has repeatedly failed.\n\n"
     #                         "Possible causes:\n"
-    #                         "• ISTJ entered Bad Authentication mode.\n"
+    #                         "• ISTJ CONTROLLER entered Bad Authentication mode.\n"
     #                         "• USB communication corruption.\n\n"
     #                         "Recommended Action:\n"
     #                         "Abort the current test.\n"
-    #                         "Reconnect the ISTJ.\n"
+    #                         "Reconnect the ISTJ CONTROLLER.\n"
     #                         "Reconnect the USB cable.\n"
     #                         "Restart the application."
     #                     ),
@@ -1397,23 +2249,29 @@ class STM32RelayController:
     @classmethod
     def _send_raw_and_check(cls, tx: bytearray,
                              expected_cmd: int, expected_state: int) -> bool:
-        for port in cls._get_stm32_ports():
+        """
+        Tries the cached last-known-good port first (no device scan). Only
+        falls back to a full cls._get_stm32_ports() scan if the cached port
+        is missing or fails to respond correctly — same pattern as
+        send_and_validate(), including holding _bus_lock around the whole
+        cache-check + scan sequence (not just the inner serial I/O).
+        """
+        def _try_port(port_device: str) -> bool:
             try:
-                with cls._bus_lock:
-                    print(f"[STM32 SERIAL] {port.device} OPEN (sync/unsync)")
-                    ser = serial.Serial(port.device, cls.BAUDRATE, timeout=cls.TIMEOUT)
-                    ser.reset_input_buffer()
-                    ser.write(tx)
-                    time.sleep(0.4)
-                    rx = ser.read(8)
-                    ser.close()
-                    print(f"[STM32 SERIAL] {port.device} CLOSED (sync/unsync)")
- 
+                print(f"[ISTJ CONTROLLER SERIAL] {port_device} OPEN (sync/unsync)")
+                ser = serial.Serial(port_device, cls.BAUDRATE, timeout=0.05)
+                ser.reset_input_buffer()
+                ser.write(tx)
+                time.sleep(0.4)
+                rx = cls._read_exact_frame(ser, 8)
+                ser.close()
+                print(f"[ISTJ CONTROLLER SERIAL] {port_device} CLOSED (sync/unsync)")
+
                 if len(rx) != 8:
-                    continue
- 
+                    return False
+
                 start, slave, length, rc, rst, rcrc, end, eof = rx
- 
+
                 # Handshake/system responses use slave = 0x35
                 if (start  != 0x02 or
                         slave  != 0x35 or    # ← CORRECT for SYNC/UNSYNC/DEFAULT
@@ -1422,15 +2280,27 @@ class STM32RelayController:
                         rst    != expected_state or
                         end    != 0x03 or
                         eof    != 0x0D):
-                    continue
- 
-                if cls.crc8([start, slave, length, rc, rst, end, eof]) == rcrc:
-                    return True
- 
+                    return False
+
+                return cls.crc8([start, slave, length, rc, rst, end, eof]) == rcrc
+
             except Exception:
-                continue
- 
-        return False
+                return False
+
+        with cls._bus_lock:
+            # ── Fast path: try the cached port directly, no enumeration ──
+            if cls._cached_port is not None:
+                if _try_port(cls._cached_port):
+                    return True
+                cls._cached_port = None   # cached port didn't answer — stop trusting it
+
+            # ── Slow path: only scans when there's no cached port, or it failed ──
+            for port in cls._get_stm32_ports():
+                if _try_port(port.device):
+                    cls._cached_port = port.device   # remember it for next call
+                    return True
+
+            return False
     
     
     @classmethod
@@ -1440,20 +2310,26 @@ class STM32RelayController:
         Response  : 02 07 02 BB B1 2D 03 0D   (8-byte ACK, slave=0x07)
         Returns a dict with 'ack': True if the frame was received,
         None if no response at all (so caller can log the difference).
+
+        Tries the cached last-known-good port first (no device scan). Only
+        falls back to a full cls._get_stm32_ports() scan if the cached port
+        is missing or fails to respond correctly. Holds _bus_lock around the
+        whole cache-check + scan sequence, matching send_and_validate() and
+        _send_raw_and_check().
         """
         tx = bytearray([0x02, 0x35, 0x02, 0xBB, 0xB0, 0xB1, 0x03, 0x0D])
-        for port in cls._get_stm32_ports():
+
+        def _try_port(port_device: str) -> bool:
             try:
-                with cls._bus_lock:
-                    ser = serial.Serial(port.device, cls.BAUDRATE, timeout=cls.TIMEOUT)
-                    ser.reset_input_buffer()
-                    ser.write(tx)
-                    time.sleep(0.4)
-                    rx = ser.read(8)
-                    ser.close()
+                ser = serial.Serial(port_device, cls.BAUDRATE, timeout=0.05)
+                ser.reset_input_buffer()
+                ser.write(tx)
+                time.sleep(0.4)
+                rx = cls._read_exact_frame(ser, 8)
+                ser.close()
 
                 if len(rx) != 8:
-                    continue
+                    return False
 
                 start, slave, length, rc, rst, rcrc, end, eof = rx
 
@@ -1464,14 +2340,27 @@ class STM32RelayController:
                         rst    != 0xB1 or
                         end    != 0x03 or
                         eof    != 0x0D):
-                    continue
+                    return False
 
-                if cls.crc8([start, slave, length, rc, rst, end, eof]) == rcrc:
-                    return {"ack": True}   # ← ACK confirmed, use hardcoded details
+                return cls.crc8([start, slave, length, rc, rst, end, eof]) == rcrc
 
             except Exception:
-                continue
-        return None   # ← no response at all
+                return False
+
+        with cls._bus_lock:
+            # ── Fast path: try the cached port directly, no enumeration ──
+            if cls._cached_port is not None:
+                if _try_port(cls._cached_port):
+                    return {"ack": True}
+                cls._cached_port = None   # cached port didn't answer — stop trusting it
+
+            # ── Slow path: only scans when there's no cached port, or it failed ──
+            for port in cls._get_stm32_ports():
+                if _try_port(port.device):
+                    cls._cached_port = port.device   # remember it for next call
+                    return {"ack": True}
+
+            return None   # ← no response at all
 
 
     

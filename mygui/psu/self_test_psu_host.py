@@ -38,7 +38,7 @@ class SelfTestPSUHost(PSUAutomationHost):
         self._abort_event = Event()
 
     def log(self, message: str, is_error: bool = False):
-        self.worker.log_signal.emit(message, is_error)
+        self.worker._prestep_log(message, is_error)
 
     def is_aborted(self) -> bool:
         return self._abort_event.is_set()

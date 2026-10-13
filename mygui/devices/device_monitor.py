@@ -6,7 +6,47 @@ from devices.device_listeners import (
 )
 import threading
 from core.stm32_commands import STM32RelayController
+class _ApxReconnectThread(QThread):
+    """
+    Runs the EXISTING devices.apx_analyzer.connect_apx() off the GUI thread.
+    connect_apx() may launch APx500, sleep ~3s and do COM init, so it must
+    never be called from the QTimer/_poll_reconnect path directly.
+    Emits result(ok, reason) exactly once. Owns no UI objects.
+    """
+    result = pyqtSignal(bool, str)
 
+    def run(self):
+        import devices.apx_analyzer as _apx_mod
+        try:
+            ok, apx = _apx_mod.connect_apx(None)    # existing official path
+            if not ok or apx is None:
+                # connect_apx returns False for demo mode, but leaves the
+                # demo instance in the module global — shut it down.
+                try:
+                    _apx_mod.close_apx()
+                except Exception:
+                    pass
+                _apx_mod.apx = None
+                self.result.emit(False, "connect_apx failed or APx is in DEMO mode")
+                return
+            # Validate it is a live, real-hardware connection.
+            _ = apx.Version
+            if apx.IsDemoMode:
+                try:
+                    _apx_mod.close_apx()
+                except Exception:
+                    pass
+                _apx_mod.apx = None
+                self.result.emit(False, "APx500 is in DEMO mode (no hardware)")
+                return
+            self.result.emit(True, "")
+        except Exception as e:
+            try:
+                _apx_mod.apx = None
+            except Exception:
+                pass
+            self.result.emit(False, str(e))
+            
 class DeviceMonitor(QObject):
     """
     Owns all device listener threads.
@@ -65,7 +105,21 @@ class DeviceMonitor(QObject):
         self._mcu_off_logged = False   # avoids re-printing "CH3 OFF, leaving it off" every 3s poll
         self._mcu_ch3_turned_on_at = None   # monotonic timestamp of the last genuine CH3 OFF→ON transition
         self._mcu_last_ch3_state = None     # last observed CH3 state, to detect the transition
+
+        # While a self-test PRE-STEP owns CH3/ISTJ (_set_mcu_status is
+        # called directly, bypassing the paused listener), suppress the
+        # UI signal so the main Equipment Self Test dashboard doesn't
+        # flicker Disconnected/Connected mid-test. Exactly one pending
+        # transition is remembered and replayed once suppression lifts —
+        # via resume_mcu_ui_signals() below — covering both a normal
+        # test finish and an aborted/terminate()'d one.
+        self._suppress_mcu_ui_signals = False
+        self._mcu_ui_signal_pending = None   # None, or ("reconnected", None) / ("disconnected", reason)
         self._tracked_instance_ids = {}     # device UI name -> id(instance), set by _handback_oscilloscope()
+
+        # APx reconnect guard: only ONE background reconnect may exist at a time.
+        self._apx_reconnect_in_progress = False
+        self._apx_reconnect_thread = None
 
         # Reconnect polling — fires on main thread every 3 s, safe for GUI
         self._reconnect_timer = QTimer(self)
@@ -75,6 +129,21 @@ class DeviceMonitor(QObject):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    
+    def handles_alive(self, worker) -> bool:
+        def _ok(inst, lock=None):
+            if inst is None:
+                return False
+            try:
+                if lock is not None:
+                    with lock:
+                        return bool(inst.query("*IDN?"))
+                return bool(inst.query("*IDN?"))
+            except Exception:
+                return False
+        return (_ok(getattr(worker, "psu_inst", None), self._psu_lock)
+                and _ok(getattr(worker, "dmm_connection", None))
+                and _ok(getattr(worker, "oscilloscope_connection", None)))
 
     def start_all(self, worker):
         """
@@ -106,10 +175,20 @@ class DeviceMonitor(QObject):
 
     def stop_all(self):
         self._reconnect_timer.stop()
+        survivors = []
         for lst in self._listeners:
+            print(f"[LISTENER] {lst.device_type} STOP REQUEST")
             lst.stop()
             lst.wait(2000)
-        self._listeners.clear()
+            if lst.isRunning():
+                # Never drop the reference to a still-running QThread —
+                # doing so risks "QThread: Destroyed while thread is
+                # still running" the moment GC collects it.
+                print(f"[LISTENER] {lst.device_type} did NOT stop within 2s — keeping reference, will not be destroyed")
+                survivors.append(lst)
+            else:
+                print(f"[LISTENER] {lst.device_type} FINISHED")
+        self._listeners = survivors
         self._disconnected_devices.clear()
 
     def refresh_from_worker(self, worker) -> None:
@@ -152,6 +231,26 @@ class DeviceMonitor(QObject):
             self._start(OscilloscopeListener(osc_conn))
             self._disconnected_devices.discard("Oscilloscope")
             worker.device_status["Oscilloscope"] = True
+
+        # Microcontroller (ISTJ) — this method previously left MCU
+        # completely untouched, unlike PSU/DMM/Oscilloscope above. That
+        # meant arriving here via the "came from Single/Full Test" path
+        # could leave NO STM32Listener running at all: whatever the card
+        # showed was just leftover status, with nothing actually polling
+        # OUTP? CH3. Manually turning CH3 off was then invisible — there
+        # was no thread watching it. Mirror the same
+        # existing-listener-first pattern refresh_for_self_test() already
+        # uses, so this path also guarantees a live listener (or an
+        # honest "Not Connected") instead of a silently unmonitored card.
+        psu_inst = getattr(worker, "psu_inst", None)
+        if psu_inst is not None:
+            existing_mcu = next(
+                (lst for lst in self._listeners
+                 if lst.device_type == DeviceType.MCU and lst.isRunning()),
+                None,
+            )
+            if existing_mcu is None:
+                self._restart_mcu_listener(worker)
 
     def refresh_for_self_test(self, worker) -> None:
         """
@@ -257,6 +356,41 @@ class DeviceMonitor(QObject):
             self._disconnected_devices.add("Oscilloscope")
         worker.device_status["Oscilloscope"] = osc_ok
 
+        # ---------------- Microcontroller (ISTJ) ----------------
+        # CH3 is the MCU's only power source, and its listener may have
+        # been explicitly stopped without ever getting to notice CH3's
+        # real state (e.g. PSU shutdown on the last time this screen was
+        # left). Re-derive status from CH3 itself rather than trusting
+        # whatever device_status was carried over.
+        mcu_ok = False
+        if psu_ok:
+            try:
+                with self._psu_lock:
+                    ch3_state = worker.psu_inst.query("OUTP? CH3").strip().upper()
+                if ch3_state in ("1", "ON"):
+                    # If a live STM32Listener already exists and is running,
+                    # trust it instead of tearing it down and reopening the
+                    # COM port. _restart_mcu_listener() closes then reopens
+                    # the serial handle — on some OSes the port isn't
+                    # immediately reusable right after close(), so an
+                    # already-healthy connection can transiently fail that
+                    # reopen and flip Connected -> Disconnected a moment
+                    # after this screen showed it as Connected.
+                    existing_mcu = next(
+                        (lst for lst in self._listeners
+                         if lst.device_type == DeviceType.MCU and lst.isRunning()),
+                        None,
+                    )
+                    if existing_mcu is not None:
+                        mcu_ok = True
+                        worker.device_status["Microcontroller"] = True
+                    else:
+                        mcu_ok = self._restart_mcu_listener(worker)  # sets status True + emits on success
+            except Exception:
+                mcu_ok = False
+        if not mcu_ok:
+            self._set_mcu_status(worker, False, "CH3 not ON or ISTJ COM port unavailable")
+
         # ---------------- Audio Analyzer (liveness only, no reconnect) ----
         from devices.apx_analyzer import get_apx
         apx_ok = False
@@ -294,19 +428,36 @@ class DeviceMonitor(QObject):
         """
         Stop and remove any listener whose device_type matches.
         Called before spawning a replacement so we never run duplicates.
+        A listener that fails to stop within the wait is kept in the
+        survivors list (never dropped) so its QThread reference stays
+        alive until it genuinely finishes — this does mean a caller
+        could theoretically end up with two listeners of the same type
+        briefly; that's preferable to a fatal Qt abort from destroying
+        a running QThread.
         """
         survivors = []
         for lst in self._listeners:
             if lst.device_type == device_type:
                 lst.stop()
                 lst.wait(1000)
+                if lst.isRunning():
+                    print(f"[LISTENER] {device_type} did not stop within 1s during replace — keeping reference")
+                    survivors.append(lst)
+                    continue
                 # stop() only flags the thread to exit — it never closes the
                 # underlying serial handle, so a paused/stopped MCU listener
                 # keeps the COM port locked for anyone trying to reopen it.
                 if device_type == DeviceType.MCU:
                     try:
                         ser = getattr(lst, "ser", None)
-                        if ser is not None and ser.is_open:
+                        # Never close STM32RelayController's shared
+                        # persistent connection here — this listener may
+                        # only be borrowing it (see _open_stm32_serial()).
+                        # Closing someone else's handle breaks relay
+                        # commands; only close a handle we independently
+                        # opened ourselves.
+                        if (ser is not None and ser.is_open
+                                and ser is not STM32RelayController._default_state_conn):
                             ser.close()
                     except Exception:
                         pass
@@ -321,7 +472,13 @@ class DeviceMonitor(QObject):
     def _on_disconnected(self, device_type: DeviceType, message: str):
         ui_name = self.DEVICE_UI_NAMES.get(device_type, str(device_type))
         if self._worker is not None:
-            self._worker.device_status[ui_name] = False   # ← keep worker.device_status truthful
+            self._worker.device_status[ui_name] = False
+
+        if device_type == DeviceType.MCU and self._suppress_mcu_ui_signals:
+            self._disconnected_devices.add(ui_name)
+            self._mcu_ui_signal_pending = ("disconnected", message)
+            return
+
         if ui_name not in self._disconnected_devices:
             self._disconnected_devices.add(ui_name)
             self.device_disconnected.emit(ui_name, message)
@@ -333,6 +490,15 @@ class DeviceMonitor(QObject):
     def _poll_reconnect(self):
         if not self._disconnected_devices:
             return
+        # A self-test pre-step may have requested the timer stop via a
+        # QueuedConnection invokeMethod, which is asynchronous and does
+        # not guarantee this callback won't still fire once more before
+        # the stop is processed. _suppress_mcu_ui_signals is a plain
+        # attribute, set synchronously by the self-test worker BEFORE it
+        # requests the timer stop, so checking it here closes that race
+        # window for the device the suppression cares about.
+        if self._suppress_mcu_ui_signals and "Microcontroller" in self._disconnected_devices:
+            return   # a self test owns PSU/DMM/scope/APx/COM: reconnect nothing now
 
         # Snapshot BEFORE this cycle's recoveries mutate the set — this tells
         # us whether the PSU itself was down at the start of this poll, even
@@ -360,8 +526,17 @@ class DeviceMonitor(QObject):
                 recovered = self._try_reconnect_apx()
 
             if recovered:
-                self._disconnected_devices.discard(ui_name)
-                self.device_reconnected.emit(ui_name)
+                # _set_mcu_status() computes was_down from
+                # _disconnected_devices itself and does its own discard —
+                # discarding it here FIRST makes was_down always False,
+                # so the reconnected signal (and thus the UI card update)
+                # silently never fires even though the MCU is genuinely
+                # back. Let _set_mcu_status() own the discard for MCU.
+                if ui_name == "Microcontroller":
+                    self._set_mcu_status(self._worker, True, "reconnect poll recovered")
+                else:
+                    self._disconnected_devices.discard(ui_name)
+                    self.device_reconnected.emit(ui_name)
 
     # ------------------------------------------------------------------
     # Per-device reconnect strategies
@@ -568,7 +743,7 @@ class DeviceMonitor(QObject):
             # own calibrated ~8s wait instead of a flat 2s that never lines up
             # with real USB enumeration time. Skip this poll cycle (no sleep on
             # the GUI thread) until the grace period has elapsed.
-            BOOT_GRACE_SECONDS = 8.0
+            BOOT_GRACE_SECONDS = 5.0
             if self._mcu_ch3_turned_on_at is not None:
                 elapsed = time.monotonic() - self._mcu_ch3_turned_on_at
                 if elapsed < BOOT_GRACE_SECONDS:
@@ -581,23 +756,27 @@ class DeviceMonitor(QObject):
                 print("[MCU Reconnect] COM port not visible yet — will retry")
                 return False
 
-            ser.close()               # release before handshake controller uses it
+            # If _open_stm32_serial() handed back STM32RelayController's
+            # shared persistent connection, do NOT close it — that would
+            # tear down relay command connectivity out from under
+            # STM32RelayController. Only close+reopen when this really is
+            # our own independently-opened handle.
+            if ser is not STM32RelayController._default_state_conn:
+                ser.close()           # release before reopening for the listener
 
-            # ── Step 5: UNSYNC → SYNC handshake ──────────────────────────────
-            STM32RelayController.unsync()
-            time.sleep(0.3)
+                # ── Step 5: SYNC handshake skipped intentionally — COM port
+                # visibility (Step 4) is treated as sufficient to mark the card
+                # "Connected". Avoids waiting on/failing over the UNSYNC→SYNC
+                # round-trip just to update UI status.
+                print("[MCU Reconnect] COM port visible — marking connected (SYNC skipped)")
 
-            if not STM32RelayController.sync():
-                print("[MCU Reconnect] SYNC failed — board not ready yet")
-                return False
-
-            print("[MCU Reconnect] SYNC confirmed ✓")
-
-            # ── Step 6: Reopen handle for listener heartbeat ──────────────────
-            ser = self._open_stm32_serial()
-            if ser is None:
-                print("[MCU Reconnect] Could not reopen COM port for listener")
-                return False
+                # ── Step 6: Reopen handle for listener heartbeat ──────────────────
+                ser = self._open_stm32_serial()
+                if ser is None:
+                    print("[MCU Reconnect] Could not reopen COM port for listener")
+                    return False
+            else:
+                print("[MCU Reconnect] COM port visible — marking connected (SYNC skipped)")
 
             self._remove_dead_listener(DeviceType.MCU)
             self._worker.device_status["Microcontroller"] = True
@@ -645,55 +824,219 @@ class DeviceMonitor(QObject):
 
     def _try_reconnect_apx(self) -> bool:
         """
-        Reconnect Audio Analyzer: use the same connect_apx helper as
-        initial discovery. AudioAnalyzerListener reads the global APx
-        object internally, so no handle needs to be passed.
+        Returns True only for the passive case (APx object is already alive).
+        A real relaunch is asynchronous: it is started here and completed in
+        _on_apx_reconnect_result(), which does its own status/signal work.
         """
+        import time as _t
+
+        # AFTER: reconnect guard — never start a second worker.
+        if self._apx_reconnect_in_progress:
+            return False
+        # A running self test owns APx (its pre-step closes/relaunches it).
+        if self._suppress_mcu_ui_signals:
+            return False
+
+        # Existing 30 s throttle preserved: don't relaunch APx500 every tick.
+        now = _t.monotonic()
+        if now - getattr(self, "_last_apx_try", 0.0) < 30.0:
+            return False
+        self._last_apx_try = now
+
         try:
-            from devices.apx_analyzer import connect_apx
-            found, connection = connect_apx(lambda msg, err: None)
-            if found:
-                self._remove_dead_listener(DeviceType.AUDIO)
-                self._worker.apx_connection = connection
-                self._worker.device_status["Audio Analyzer"] = True
-                self._start(AudioAnalyzerListener())
-                return True
-        except Exception:
-            pass
+            from devices.apx_analyzer import get_apx
+            apx = get_apx()
+            if apx is not None:
+                try:
+                    _ = apx.Version             # passive liveness check
+                    self._remove_dead_listener(DeviceType.AUDIO)
+                    self._worker.device_status["Audio Analyzer"] = True
+                    self._start(AudioAnalyzerListener())
+                    return True
+                except Exception:
+                    pass                        # object is dead -> relaunch below
+
+            # BEFORE: get_apx() is None (APx500 closed) -> return False forever.
+            # AFTER:  APx500 may have been completely closed, so reconnect with
+            #         the existing connect_apx() lifecycle in a BACKGROUND
+            #         worker instead of only inspecting the old object.
+            self._apx_reconnect_in_progress = True
+            th = _ApxReconnectThread()
+            self._apx_reconnect_thread = th
+            th.result.connect(self._on_apx_reconnect_result)
+            th.finished.connect(lambda t=th: self._on_apx_thread_finished(t))
+            th.start()
+            print("[APX Reconnect] background reconnect started")
+        except Exception as e:
+            self._apx_reconnect_in_progress = False
+            print(f"[APX Reconnect] could not start worker: {e}")
         return False
+
+    @pyqtSlot(bool, str)
+    def _on_apx_reconnect_result(self, ok: bool, reason: str):
+        """Main-thread handler. DeviceMonitor owns the state; the UI only
+        receives device_reconnected, so a destroyed screen is harmless."""
+        self._apx_reconnect_in_progress = False   # failure -> later poll retries
+        if not ok:
+            print(f"[APX Reconnect] failed: {reason} — will retry on a later poll")
+            return
+        if self._suppress_mcu_ui_signals:
+            # A self test started meanwhile; it relaunches APx itself and
+            # _resume_monitor_listeners() restores the listener afterwards.
+            print("[APX Reconnect] self test active — deferring listener start")
+            return
+        # Exactly ONE fresh listener: remove any dead/stale one first.
+        self._remove_dead_listener(DeviceType.AUDIO)
+        self._start(AudioAnalyzerListener())
+        if self._worker is not None:
+            self._worker.device_status["Audio Analyzer"] = True
+        was_down = "Audio Analyzer" in self._disconnected_devices
+        self._disconnected_devices.discard("Audio Analyzer")
+        if was_down:
+            self.device_reconnected.emit("Audio Analyzer")
+        print("[APX Reconnect] Audio Analyzer reconnected ✓")
+
+    def _on_apx_thread_finished(self, thread):
+        # Defensive: clear the guard even if the thread died without emitting.
+        # The thread reference is dropped only after Qt says it has finished.
+        if thread is self._apx_reconnect_thread:
+            self._apx_reconnect_thread = None
+            self._apx_reconnect_in_progress = False
 
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
     def _open_stm32_serial(self):
         """
-        Scan all COM ports and return a serial handle for the MCU.
-        Match by VID (integer) or description keywords — no port hard-bind.
+        Open a serial handle for the MCU via the ONE authoritative port
+        resolver, STM32RelayController.get_cached_or_discover_port() —
+        no independent comports() scan here anymore. This makes the
+        screen's notion of "the ISTJ port" and the relay controller's
+        _cached_port the SAME cache (Req #3/#8/#9): a full USB enumeration
+        only happens when that cache is actually invalid, and it benefits
+        every caller of this method identically — start_all(),
+        refresh_for_self_test(), _restart_mcu_listener(),
+        _try_reconnect_stm32() — with zero changes to any of them.
         """
         import serial
-        import serial.tools.list_ports
 
         cfg = self.DEVICE_IDENTIFIERS["MCU"]
+        port = STM32RelayController.get_cached_or_discover_port()
+        if port is None:
+            return None
 
-        for p in serial.tools.list_ports.comports():
-            desc = p.description or ""
+        # ── Reuse STM32RelayController's own persistent connection if
+        # it's already open on this exact port, instead of opening a
+        # SECOND independent serial.Serial handle. A COM port is
+        # exclusive-access at the OS level — a second concurrent open on
+        # the same port from this same process fails every time with a
+        # busy/access-denied error, and the old code below mistook that
+        # failure for "device not present", invalidating _cached_port on
+        # an already-healthy, already-connected controller. This is the
+        # actual cause of "COM port not visible yet — will retry" firing
+        # forever even while ISTJ is genuinely connected.
+        shared = STM32RelayController._default_state_conn
+        if (shared is not None and getattr(shared, "is_open", False)
+                and getattr(shared, "port", None) == port):
+            return shared
 
-            # Hard skip — noise ports
-            if any(k in desc for k in cfg["skip_keywords"]):
-                continue
-
-            # VID match (most reliable) or description keyword match
-            vid_match  = (p.vid == cfg["vid"])
-            desc_match = any(k in desc for k in cfg["description_keywords"])
-
-            if not (vid_match or desc_match):
-                continue
-
-            try:
-                ser = serial.Serial(p.device, cfg["baud"], timeout=1)
-                if ser.isOpen():
-                    return ser
-            except Exception:
-                continue
+        try:
+            ser = serial.Serial(port, cfg["baud"], timeout=1)
+            if ser.isOpen():
+                return ser
+        except Exception:
+            # Re-check the shared connection once more before giving up —
+            # a race where sync() opened _default_state_conn a moment
+            # after get_cached_or_discover_port() ran above would land
+            # here. Only invalidate the cache if there's truly no live
+            # connection to fall back on.
+            shared = STM32RelayController._default_state_conn
+            if (shared is not None and getattr(shared, "is_open", False)
+                    and getattr(shared, "port", None) == port):
+                return shared
+            # Cached port existed but couldn't actually be opened (claimed
+            # elsewhere, or genuinely gone) — invalidate so the NEXT call
+            # re-discovers instead of retrying the same dead port forever.
+            STM32RelayController._cached_port = None
 
         return None
+    
+    def _restart_mcu_listener(self, worker=None) -> bool:
+        """
+        Remove any existing MCU listener and start a brand-new STM32Listener
+        on a freshly opened serial handle. This is the ONLY place besides
+        _try_reconnect_stm32() that is allowed to create an STM32Listener —
+        used by SelfTestWorker's pre-step after it power-cycles CH3 and does
+        its own raw ISTJ sync, so DeviceMonitor regains ownership of MCU
+        connectivity monitoring afterward instead of being left with none.
+
+        Never call this while an MCU listener you still want is running —
+        it always removes-then-recreates.
+        """
+        worker = worker or self._worker
+        if worker is None:
+            return False
+
+        self._remove_dead_listener(DeviceType.MCU)
+
+        ser = self._open_stm32_serial()
+        if ser is None:
+            return False
+
+        self._start(STM32Listener(ser, psu_inst=getattr(worker, "psu_inst", None), psu_lock=self._psu_lock))
+        # _set_mcu_status also fires device_reconnected — without it the
+        # screen's card never learns the sync succeeded.
+        self._set_mcu_status(worker, True, "ISTJ listener restarted")
+        return True
+    
+    def _set_mcu_status(self, worker, connected: bool, reason: str = "") -> None:
+        """
+        ...
+        While a self-test PRE-STEP owns CH3/ISTJ (_suppress_mcu_ui_signals
+        is True), the transition is still tracked in device_status/
+        _disconnected_devices as before — callers that read those directly
+        keep working — but the signal itself is deferred to
+        resume_mcu_ui_signals() instead of firing immediately, so the
+        equipment screen doesn't flicker mid-test.
+        """
+        if worker is not None:
+            worker.device_status["Microcontroller"] = connected
+        if connected:
+            was_down = "Microcontroller" in self._disconnected_devices
+            self._disconnected_devices.discard("Microcontroller")
+            if was_down:
+                if self._suppress_mcu_ui_signals:
+                    self._mcu_ui_signal_pending = ("reconnected", None)
+                else:
+                    self.device_reconnected.emit("Microcontroller")
+        else:
+            was_up = "Microcontroller" not in self._disconnected_devices
+            self._disconnected_devices.add("Microcontroller")
+            if was_up:
+                final_reason = reason or "PSU Channel 3 is OFF"
+                if self._suppress_mcu_ui_signals:
+                    self._mcu_ui_signal_pending = ("disconnected", final_reason)
+                else:
+                    self.device_disconnected.emit("Microcontroller", final_reason)
+
+    def resume_mcu_ui_signals(self):
+        """
+        Stop suppressing Microcontroller status signals and replay the
+        single most recent transition recorded while suppressed, if any.
+        Call this whenever a self-test that owned CH3/ISTJ finishes —
+        normally (SelfTestWorker's own finally) or aborted (SelfTestDialog's
+        _resume_listeners_after_abort(), which is the only place that can
+        still run after a hard terminate() skipped the worker's own
+        cleanup). Idempotent — a second call with nothing pending is a
+        no-op, so it's always safe to call defensively.
+        """
+        self._suppress_mcu_ui_signals = False
+        pending = self._mcu_ui_signal_pending
+        self._mcu_ui_signal_pending = None
+        if pending is None:
+            return
+        kind, reason = pending
+        if kind == "reconnected":
+            self.device_reconnected.emit("Microcontroller")
+        else:
+            self.device_disconnected.emit("Microcontroller", reason)

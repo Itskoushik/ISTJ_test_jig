@@ -7,6 +7,7 @@ from core.tuning_workflow import set_popup_title
 import core.dmm_reader as _dmm_module
 from devices.power_supply import check_current_ch3
 from core.oscilloscope_helper import set_ch1_ch2_scale_10v
+from core.test_abort import TestAbortRequested
 # ── Relay command registry ──────────────────────────────────────────────────
 # Main relays: S21, S22, S23, S26
 # Sub relays:  J30 .. J54
@@ -81,7 +82,7 @@ def _relay_send(screen, cmd_name: str, relay_history: list, *, retry_on_fail: bo
         screen.log_signal.emit(f"ERROR: Unknown relay command '{cmd_name}'", True)
         return False
 
-    ok = STM32RelayController.send_with_retry(fn)
+    ok = STM32RelayController.send_with_retry_self_test(fn)
 
     if ok:
         relay_history.append(cmd_name)
@@ -90,21 +91,35 @@ def _relay_send(screen, cmd_name: str, relay_history: list, *, retry_on_fail: bo
     if not retry_on_fail:
         return False
 
+    # Abort takes priority over recovery — do not start a CH3 power-cycle
+    # and relay replay sequence that will just have to be unwound.
+    if getattr(screen, "abort_event", None) is not None and screen.abort_event.is_set():
+        print(f"[RECOVERY] Relay '{cmd_name}' failed — abort requested, skipping recovery")
+        return False
+
+    # ── Recovery: CH3 power-cycle + STM32 sync ───────────────────────────────
     print(f"[RECOVERY] Relay '{cmd_name}' failed — power-cycling CH3 and replaying state...")
+
     _ch3_power_cycle(screen)
     _stm32_sync_wait(screen)
 
+    if getattr(screen, "abort_event", None) is not None and screen.abort_event.is_set():
+        print("[RECOVERY] Abort requested mid-recovery — skipping relay replay")
+        return False
+
+    # Replay all previously successful commands
     print(f"[RECOVERY] Replaying {len(relay_history)} prior relay command(s)...")
     for prev_cmd in relay_history:
-        prev_fn = _RELAY_CMD_MAP.get(prev_cmd)
-        if prev_fn is None:
-            continue
-        rep_ok = STM32RelayController.send_with_retry(prev_fn)
+        if getattr(screen, "abort_event", None) is not None and screen.abort_event.is_set():
+            print("[RECOVERY] Abort requested during replay — stopping replay early")
+            return False
+        prev_fn = _RELAY_CMD_MAP[prev_cmd]
+        rep_ok = STM32RelayController.send_with_retry_self_test(prev_fn)
         status = "✓" if rep_ok else "✗ (non-fatal)"
         print(f"[RECOVERY]   {prev_cmd} → {status}")
         time.sleep(0.3)
 
-    time.sleep(1.2)
+    time.sleep(0.5)
 
     print(f"[RECOVERY] Retrying '{cmd_name}'...")
     retry_ok = _relay_send(screen, cmd_name, relay_history, retry_on_fail=False)
@@ -139,7 +154,7 @@ def _stm32_sync_wait(screen):
     print("[RECOVERY] Syncing STM32...")
     for attempt in range(3):
         try:
-            ok = STM32RelayController.send_with_retry(STM32RelayController.sync)
+            ok = STM32RelayController.send_with_retry_self_test(STM32RelayController.sync)
             if ok:
                 print("[RECOVERY] STM32 sync confirmed ✓")
                 time.sleep(1.0)
@@ -149,6 +164,40 @@ def _stm32_sync_wait(screen):
         time.sleep(2.0)
     print("[RECOVERY] STM32 sync not confirmed after 3 attempts — continuing")
 
+
+def _istj_shutdown_tail(screen):
+    """
+    Hardware-safety tail for an aborted ISTJ self test. Mirrors the
+    end-of-test relay-off pattern used throughout this module: every
+    relay this test can leave energized is commanded OFF, then every
+    PSU channel this test can leave ON (CH1, CH2) is switched off.
+    Non-fatal on any individual failure — best-effort, not atomic.
+    """
+    screen.log_signal.emit("[ABORT] ISTJ self test cancelled — powering down relays/PSU...", False)
+    off_fns = [
+        STM32RelayController.set_s21_off, STM32RelayController.set_s22_off,
+        STM32RelayController.set_s26_off, STM32RelayController.set_s23_local,
+        STM32RelayController.set_s24_off, STM32RelayController.set_s25_off,
+        STM32RelayController.set_s27_off, STM32RelayController.set_s29_off,
+        STM32RelayController.set_s30_off, STM32RelayController.set_s32_off,
+        STM32RelayController.set_s34_off, STM32RelayController.set_s33_off,
+        STM32RelayController.set_s35_off,
+    ]
+    for fn in off_fns:
+        try:
+            STM32RelayController.send_with_retry_self_test(fn)
+        except Exception:
+            pass
+    try:
+        from devices.apx_analyzer import generator_control
+        generator_control(screen, state="OFF")
+    except Exception:
+        pass
+    try:
+        _psu_ch1_off(screen)
+        _psu_ch2_off(screen)
+    except Exception as e:
+        screen.log_signal.emit(f"[ABORT] PSU shutdown failed (non-fatal): {e}", False)
 
 # ── Core relay-group runner ─────────────────────────────────────────────────
 def _run_relay_group(screen, relay_history, group_relays, row_start, limits_table, overload_text=None, skip=None):
@@ -163,6 +212,7 @@ def _run_relay_group(screen, relay_history, group_relays, row_start, limits_tabl
     skip = skip or set()
 
     for offset, relay in enumerate(group_relays):
+        screen.check_abort()
         row = row_start + offset
         cmd_on = f"set_{relay}_on"
         cmd_off = f"set_{relay}_off"
@@ -363,7 +413,7 @@ def _run_pairing_channel(screen, label, s_on, s_off, j_on, j_off, s_row, j_row, 
     baseline_val = baseline["value"] if baseline else None
 
     # ── S relay ON ───────────────────────────────────────────────────────
-    s_ok = STM32RelayController.send_with_retry(s_on)
+    s_ok = STM32RelayController.send_with_retry_self_test(s_on)
     after_s_val = baseline_val
 
     if s_ok:
@@ -391,7 +441,7 @@ def _run_pairing_channel(screen, label, s_on, s_off, j_on, j_off, s_row, j_row, 
         pair_pass = False
 
     # ── J relay ON ───────────────────────────────────────────────────────
-    j_ok = STM32RelayController.send_with_retry(j_on)
+    j_ok = STM32RelayController.send_with_retry_self_test(j_on)
 
     if j_ok:
         time.sleep(1.2)
@@ -441,9 +491,9 @@ def _run_pairing_channel(screen, label, s_on, s_off, j_on, j_off, s_row, j_row, 
 
     # ── Turn OFF J then S relay before next pair ─────────────────────────
     time.sleep(0.3)
-    STM32RelayController.send_with_retry(j_off)
+    STM32RelayController.send_with_retry_self_test(j_off)
     time.sleep(0.3)
-    STM32RelayController.send_with_retry(s_off)
+    STM32RelayController.send_with_retry_self_test(s_off)
     time.sleep(0.3)
 
     return pair_pass
@@ -487,7 +537,7 @@ def _run_sbsel_test(screen):
     baseline_val = baseline["value"] if baseline else None
 
     # ── S35 (SB SEL) ON ──────────────────────────────────────────────────
-    sbsel_ok = STM32RelayController.send_with_retry(STM32RelayController.set_s35_on)
+    sbsel_ok = STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s35_on)
     sbsel_current_val = baseline_val
 
     if sbsel_ok:
@@ -516,6 +566,7 @@ def _run_sbsel_test(screen):
 
     # ── S/J pairs, gated on SB SEL current ──────────────────────────────
     for label, s_on, s_off, j_on, j_off, s_row in _SBSEL_PAIRS:
+        screen.check_abort()
         j_row = s_row + 1
         gh_row = s_row
         pair_pass = True
@@ -524,7 +575,7 @@ def _run_sbsel_test(screen):
         screen.log_signal.emit(f"({label}) pair test started", False)
 
         # ── S relay ON — must exceed SB SEL current ─────────────────────
-        s_ok = STM32RelayController.send_with_retry(s_on)
+        s_ok = STM32RelayController.send_with_retry_self_test(s_on)
         after_s_val = sbsel_current_val
 
         if s_ok:
@@ -549,7 +600,7 @@ def _run_sbsel_test(screen):
             pair_pass = False
 
         # ── J relay ON — must exceed S-relay current ────────────────────
-        j_ok = STM32RelayController.send_with_retry(j_on)
+        j_ok = STM32RelayController.send_with_retry_self_test(j_on)
 
         if j_ok:
             time.sleep(1.2)
@@ -595,15 +646,15 @@ def _run_sbsel_test(screen):
 
         # ── Turn OFF J then S before next pair ───────────────────────────
         time.sleep(0.3)
-        STM32RelayController.send_with_retry(j_off)
+        STM32RelayController.send_with_retry_self_test(j_off)
         time.sleep(0.3)
-        STM32RelayController.send_with_retry(s_off)
+        STM32RelayController.send_with_retry_self_test(s_off)
         time.sleep(0.3)
 
         sbsel_overall_pass &= pair_pass
 
     # ── Turn OFF S35 (SB SEL) at the end ─────────────────────────────────
-    STM32RelayController.send_with_retry(STM32RelayController.set_s35_off)
+    STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s35_off)
     time.sleep(0.3)
 
     if sbsel_overall_pass:
@@ -644,6 +695,7 @@ def _run_extra_triplet_test(screen):
     overall_pass = True
 
     for label, r1_on, r1_off, r2_on, r2_off, r3_on, r3_off, row_start in _EXTRA_TRIPLETS:
+        screen.check_abort()
         r1_row, r2_row, r3_row = row_start, row_start + 1, row_start + 2
         gh_row = row_start
         r1_name, r2_name, r3_name = [p.strip() for p in label.split("/")]
@@ -657,7 +709,7 @@ def _run_extra_triplet_test(screen):
         baseline_val = baseline["value"] if baseline else None
 
         # ── r1 (S31/S28) ON ─────────────────────────────────────────────
-        r1_ok = STM32RelayController.send_with_retry(r1_on)
+        r1_ok = STM32RelayController.send_with_retry_self_test(r1_on)
         after_r1_val = baseline_val
 
         if r1_ok:
@@ -681,7 +733,7 @@ def _run_extra_triplet_test(screen):
             triplet_pass = False
 
         # ── r2 (S14/S19) ON ─────────────────────────────────────────────
-        r2_ok = STM32RelayController.send_with_retry(r2_on)
+        r2_ok = STM32RelayController.send_with_retry_self_test(r2_on)
         after_r2_val = after_r1_val
 
         if r2_ok:
@@ -705,7 +757,7 @@ def _run_extra_triplet_test(screen):
             triplet_pass = False
 
         # ── r3 (J29/J26) ON ─────────────────────────────────────────────
-        r3_ok = STM32RelayController.send_with_retry(r3_on)
+        r3_ok = STM32RelayController.send_with_retry_self_test(r3_on)
 
         if r3_ok:
             time.sleep(1.2)
@@ -750,11 +802,11 @@ def _run_extra_triplet_test(screen):
 
         # ── Turn OFF r3, r2, r1 before next triplet ──────────────────────
         time.sleep(0.3)
-        STM32RelayController.send_with_retry(r3_off)
+        STM32RelayController.send_with_retry_self_test(r3_off)
         time.sleep(0.3)
-        STM32RelayController.send_with_retry(r2_off)
+        STM32RelayController.send_with_retry_self_test(r2_off)
         time.sleep(0.3)
-        STM32RelayController.send_with_retry(r1_off)
+        STM32RelayController.send_with_retry_self_test(r1_off)
         time.sleep(0.3)
 
         overall_pass &= triplet_pass
@@ -797,11 +849,6 @@ _VOLTAGE_RELAY_GROUPS = [
 
 def _run_voltage_relay_channel(screen, relay_history, label, j_on, j_off, row,
                                 min_v, max_v):
-    """
-    Turns a J relay ON, logs CONNECTED/FAILED to F{row} based on relay-send
-    success, reads DUT voltage against (min_v, max_v), logs H/I{row}, then
-    turns the J relay back OFF.
-    """
     channel_pass = True
 
     j_ok = _relay_send(screen, j_on, relay_history)
@@ -827,7 +874,11 @@ def _run_voltage_relay_channel(screen, relay_history, label, j_on, j_off, row,
         channel_pass = False
 
     time.sleep(0.3)
-    STM32RelayController.send_with_retry(_RELAY_CMD_MAP[j_off])
+    # Route the OFF through _relay_send() too — not just send_with_retry_self_test()
+    # directly — so relay_history's last entry for this relay reflects
+    # OFF. Without this, a later failure's recovery replay resurrects the
+    # stale "_on" entry and switches an already-off relay back on.
+    _relay_send(screen, j_off, relay_history)
     time.sleep(0.3)
 
     return channel_pass
@@ -866,10 +917,12 @@ def _run_voltage_relay_test(screen):
             overall_pass &= step_pass
 
         time.sleep(0.3)
-        STM32RelayController.send_with_retry(_RELAY_CMD_MAP[s_off])
+        # Same fix: route through _relay_send() so history's last S-relay
+        # entry is OFF, not the stale ON from earlier in this loop.
+        _relay_send(screen, s_off, relay_history)
         time.sleep(0.3)
         
-    _psu_channel_off(screen, 1)
+    _psu_ch1_off(screen)
     
     if overall_pass:
         screen.log_signal.emit("==========VOLTAGE RELAY TEST COMPLETED SUCCESSFULLY==========", False)
@@ -919,7 +972,8 @@ def _visual_relay_step(screen, relay_on_fn, relay_off_fn, f_row, ds_label,
     inspection popup (H/I{h_row}/{i_row}), then optionally turns the relay
     back OFF before returning.
     """
-    ok = STM32RelayController.send_with_retry(relay_on_fn)
+    screen.check_abort()
+    ok = STM32RelayController.send_with_retry_self_test(relay_on_fn)
     write_self_test_excel(f"F{f_row}", "CONNECTED" if ok else "FAILED")
 
     if ok:
@@ -932,7 +986,7 @@ def _visual_relay_step(screen, relay_on_fn, relay_off_fn, f_row, ds_label,
 
     if turn_off_after and relay_off_fn is not None:
         time.sleep(0.3)
-        STM32RelayController.send_with_retry(relay_off_fn)
+        STM32RelayController.send_with_retry_self_test(relay_off_fn)
         time.sleep(0.3)
 
     return ok and popup_pass
@@ -954,17 +1008,27 @@ def _psu_channel_on(screen, channel: int, voltage: float, current: float):
     except Exception as e:
         screen.log_signal.emit(f"ERROR: PSU CH{channel} ON failed: {e}", True)
 
-
-def _psu_channel_off(screen, channel: int):
-    """Turn off the given PSU channel."""
+def _psu_ch1_off(screen):
+    """Turn off PSU CH1."""
     try:
-        screen.psu.psu_send_command(f"INST:NSEL {channel}")
+        screen.psu.psu_send_command("INST:NSEL 1")
         time.sleep(0.1)
         screen.psu.psu_send_command("OUTP OFF")
         time.sleep(0.3)
-        screen.log_signal.emit(f"PSU CH{channel} OFF", False)
+        screen.log_signal.emit("PSU CH1 OFF (PASS)", False)
     except Exception as e:
-        screen.log_signal.emit(f"ERROR: PSU CH{channel} OFF failed: {e}", True)
+        screen.log_signal.emit(f"ERROR: PSU CH1 OFF failed: {e} (FAIL)", True)
+        
+def _psu_ch2_off(screen):
+    """Turn off PSU CH2."""
+    try:
+        screen.psu.psu_send_command("INST:NSEL 2")
+        time.sleep(0.1)
+        screen.psu.psu_send_command("OUTP OFF")
+        time.sleep(0.3)
+        screen.log_signal.emit("PSU CH2 OFF (PASS)", False)
+    except Exception as e:
+        screen.log_signal.emit(f"ERROR: PSU CH2 OFF failed: {e} (FAIL)", True)
         
 def _run_visual_inspection_test(screen):
     """
@@ -989,7 +1053,7 @@ def _run_visual_inspection_test(screen):
         STM32RelayController.set_s23_local, STM32RelayController.set_s24_off,
         STM32RelayController.set_s25_off, STM32RelayController.set_s26_off,
     ):
-        STM32RelayController.send_with_retry(off_fn)
+        STM32RelayController.send_with_retry_self_test(off_fn)
         time.sleep(0.2)
 
     time.sleep(0.5)
@@ -1033,7 +1097,7 @@ def _run_visual_inspection_test(screen):
     overall_pass &= p
 
     # DS9 (LOCAL) — S23 OFF only, no prior ON step
-    s23_off_ok = STM32RelayController.send_with_retry(STM32RelayController.set_s23_local)
+    s23_off_ok = STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s23_local)
     write_self_test_excel("F184", "CONNECTED" if s23_off_ok else "FAILED")
     if s23_off_ok:
         screen.log_signal.emit("S23 successfully set to LOCAL (PASS)", False)
@@ -1081,8 +1145,8 @@ def _run_visual_inspection_test(screen):
     overall_pass &= p
 
     # ── PSU CH1/CH2 OFF — test finished ──────────────────────────────────
-    _psu_channel_off(screen, 1)
-    _psu_channel_off(screen, 2)
+    _psu_ch1_off(screen)
+    _psu_ch2_off(screen)
 
     if overall_pass:
         screen.log_signal.emit("==========VISUAL INSPECTION CHECK COMPLETED SUCCESSFULLY==========", False)
@@ -1113,9 +1177,9 @@ def _run_norm_stby_remote_test(screen):
     time.sleep(0.5)
 
     # ── S24 (NORM PWR / DS10,DS11) ───────────────────────────────────────
-    STM32RelayController.send_with_retry(STM32RelayController.set_s23_local)
+    STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s23_local)
     time.sleep(0.3)
-    s24_ok = STM32RelayController.send_with_retry(STM32RelayController.set_s24_on)
+    s24_ok = STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s24_on)
     write_self_test_excel("F206", "CONNECTED" if s24_ok else "FAILED")
     write_self_test_excel("F208", "CONNECTED" if s24_ok else "FAILED")
     if s24_ok:
@@ -1131,7 +1195,7 @@ def _run_norm_stby_remote_test(screen):
     )
     overall_pass &= (s24_ok and p1)
 
-    s23_rem_ok1 = STM32RelayController.send_with_retry(STM32RelayController.set_s23_remote)
+    s23_rem_ok1 = STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s23_remote)
     if s23_rem_ok1:
         screen.log_signal.emit("S23 successfully set to REMOTE (PASS)", False)
     else:
@@ -1146,12 +1210,12 @@ def _run_norm_stby_remote_test(screen):
     overall_pass &= (s23_rem_ok1 and p2)
 
     time.sleep(0.3)
-    STM32RelayController.send_with_retry(STM32RelayController.set_s24_off)
-    STM32RelayController.send_with_retry(STM32RelayController.set_s23_local)
+    STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s24_off)
+    STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s23_local)
     time.sleep(0.3)
 
     # ── S25 (STBY PWR / DS12,DS13) ───────────────────────────────────────
-    s25_ok = STM32RelayController.send_with_retry(STM32RelayController.set_s25_on)
+    s25_ok = STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s25_on)
     write_self_test_excel("F207", "CONNECTED" if s25_ok else "FAILED")
     write_self_test_excel("F209", "CONNECTED" if s25_ok else "FAILED")
     if s25_ok:
@@ -1167,7 +1231,7 @@ def _run_norm_stby_remote_test(screen):
     )
     overall_pass &= (s25_ok and p3)
 
-    s23_rem_ok2 = STM32RelayController.send_with_retry(STM32RelayController.set_s23_remote)
+    s23_rem_ok2 = STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s23_remote)
     if s23_rem_ok2:
         screen.log_signal.emit("S23 switched to REMOTE (PASS)", False)
     else:
@@ -1182,11 +1246,11 @@ def _run_norm_stby_remote_test(screen):
     overall_pass &= (s23_rem_ok2 and p4)
 
     time.sleep(0.3)
-    STM32RelayController.send_with_retry(STM32RelayController.set_s25_off)
-    STM32RelayController.send_with_retry(STM32RelayController.set_s23_local)
+    STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s25_off)
+    STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s23_local)
     time.sleep(0.3)
 
-    _psu_channel_off(screen, 1)
+    _psu_ch1_off(screen)
 
     if overall_pass:
         screen.log_signal.emit("==========VISUAL CHECK OF RELAY K101 COMPLETED SUCCESSFULLY==========", False)
@@ -1211,6 +1275,7 @@ def _run_pairing_test(screen):
     row_start = 110
 
     for idx, (label, s_on, s_off, j_on, j_off) in enumerate(_PAIRING_RELAYS):
+        screen.check_abort()
         s_row = row_start + idx * 2
         j_row = s_row + 1
         gh_row = s_row
@@ -1241,39 +1306,54 @@ def _run_pairing_test(screen):
     return overall_pass
 
 
-# ── Update run() to include the new pairing test ────────────────────────────
-def run(screen):
-    set_ch1_ch2_scale_10v(screen)
-    set_popup_title("Self ISTJ Test")
-    screen.log_signal.emit("==========COMMENCING ISTJ SELF TEST==========", False)
-
+def _run_istj_sequence(screen):
+    screen.check_abort()
     screen.operator_signal.emit(
         "⚠ Operator Action Required",
         "• Please ensure that the ISTJ Self test board is properly connected.",
         str(RESOURCES_DIR / "self_test.jpeg")
     )
     screen._operator_event.wait()
-    time.sleep(1.2)
+    screen.check_abort()
+    screen.abortable_sleep(1.2)
 
     screen.log_signal.emit("==========COMMENCING SINGLE RELAY TEST WITH DMM==========", False)
     _run_resistance_test(screen)
+    screen.check_abort()
 
-    time.sleep(1.2)
+    screen.abortable_sleep(1.2)
     screen.log_signal.emit("==========COMMENCING RELAY PAIRING TEST WITH APX==========", False)
     _run_pairing_test(screen)
-    
-    time.sleep(1.2)
+    screen.check_abort()
+
+    screen.abortable_sleep(1.2)
     screen.log_signal.emit("==========COMMENCING VISUAL INSPECTION==========", False)
-    _run_visual_inspection_test(screen)   
-    
-    time.sleep(1.2)
+    _run_visual_inspection_test(screen)
+    screen.check_abort()
+
+    screen.abortable_sleep(1.2)
     _run_norm_stby_remote_test(screen)
-    
-    time.sleep(1.2)
+    screen.check_abort()
+
+    screen.abortable_sleep(1.2)
     screen.log_signal.emit("==========COMMENCING VOLTAGE RELAY TEST==========", False)
-    _run_voltage_relay_test(screen) 
-    
+    _run_voltage_relay_test(screen)
+    screen.check_abort()
 
+    screen.abortable_sleep(1.2)
 
-    time.sleep(1.2)
     screen.log_signal.emit("==========SUCCESSFULLY COMPLETED ISTJ SELF TEST==========", False)
+    _psu_ch1_off(screen)
+    _psu_ch2_off(screen)
+
+
+def run(screen):
+    set_ch1_ch2_scale_10v(screen)
+    set_popup_title("Self ISTJ Test")
+    screen.log_signal.emit("==========COMMENCING ISTJ SELF TEST==========", False)
+
+    try:
+        _run_istj_sequence(screen)
+    except TestAbortRequested:
+        _istj_shutdown_tail(screen)
+        raise

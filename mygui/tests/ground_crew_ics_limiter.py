@@ -97,7 +97,7 @@ def run_norm(screen):
 
     QApplication.processEvents()
     time.sleep(0.5)
-    screen.log_signal.emit("Connecting Headset Adapter to HEADSET J25", False)
+    screen.log_signal.emit("Connecting Headset Adapter to HEADSET JACK 2", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
     time.sleep(0.5)
     autoset_oscilloscope(screen)
@@ -106,14 +106,14 @@ def run_norm(screen):
     screen.operator_event.clear()
     screen.show_popup_signal.emit(
         "⚠ Operator Action Required",
-        "• Connect Headset Adapter to HEADSET J25\n",
+        "• Connect Headset Adapter to HEADSET JACK 2\n",
         RESOURCES_DIR / "headsetjb.jpeg",
         "ok",None
     )
     # ⏸ WAIT until operator clicks OK
     screen.operator_event.wait()
     time.sleep(0.5)
-    screen.log_signal.emit("headset adapter connected to HEADSET J25", False)
+    screen.log_signal.emit("headset adapter connected to HEADSET JACK 2", False)
 
     # 🛑 PAUSE POINT
     screen.check_abort()
@@ -138,14 +138,14 @@ def run_norm(screen):
     
     screen.log_signal.emit("headset audio check completed", False)
 
-    screen.log_signal.emit("Disconnecting Headset Adapter from HEADSET J25", False)
+    screen.log_signal.emit("Disconnecting Headset Adapter from HEADSET JACK 2", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
     # 🛑 PAUSE POINT
     screen.check_abort()
     screen.operator_event.clear()
     screen.show_popup_signal.emit(
         "⚠ Operator Action Required",
-        "• Disconnect Headset Adapter from HEADSET J25\n",
+        "• Disconnect Headset Adapter from HEADSET JACK 2\n",
         RESOURCES_DIR / "headsetjb1.jpeg",
         "ok",None
     )
@@ -153,7 +153,7 @@ def run_norm(screen):
     screen.operator_event.wait()
     time.sleep(0.5)
     set_ch1_ch2_scale_10v(screen)
-    screen.log_signal.emit("headset adapter disconnected from HEADSET J25", False)
+    screen.log_signal.emit("headset adapter disconnected from HEADSET JACK 2", False)
     
     if STM32RelayController.send_with_retry(STM32RelayController.set_j24_on):
         screen.log_signal.emit("MIC OUT Connector J24 successfully  Connected", False)
@@ -278,21 +278,21 @@ def run_stby(screen):
     QApplication.processEvents()
     time.sleep(0.5)
     autoset_oscilloscope(screen)
-    screen.log_signal.emit("Connecting Headset Adapter to HEADSET J25", False)
+    screen.log_signal.emit("Connecting Headset Adapter to HEADSET JACK 2", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
     # 🛑 PAUSE POINT
     screen.check_abort()
     screen.operator_event.clear()
     screen.show_popup_signal.emit(
         "⚠ Operator Action Required",
-        "• Connect Headset Adapter to HEADSET J25\n",
+        "• Connect Headset Adapter to HEADSET JACK 2\n",
         RESOURCES_DIR / "headsetjb.jpeg",
         "ok",None
     )
     # ⏸ WAIT until operator clicks OK
     screen.operator_event.wait()
     time.sleep(0.5)
-    screen.log_signal.emit("headset adapter connected to HEADSET J25", False)  
+    screen.log_signal.emit("headset adapter connected to HEADSET JACK 2", False)  
 
     QApplication.processEvents()
     time.sleep(0.5)
@@ -318,14 +318,14 @@ def run_stby(screen):
     write_excel_dynamic("F410",operator)   # YES
     write_excel_dynamic("K410",result)     # PASS 
     screen.log_signal.emit("headset audio check completed", False)
-    screen.log_signal.emit("Disconnecting Headset Adapter from HEADSET J25", False)
+    screen.log_signal.emit("Disconnecting Headset Adapter from HEADSET JACK 2", False)
     QApplication.processEvents()   # 🔑 FORCE UI UPDATE
     # 🛑 PAUSE POINT
     screen.check_abort()
     screen.operator_event.clear()
     screen.show_popup_signal.emit(
         "⚠ Operator Action Required",
-        "• Disconnect Headset Adapter from HEADSET J25\n",
+        "• Disconnect Headset Adapter from HEADSET JACK 2\n",
         RESOURCES_DIR / "headsetjb1.jpeg",
         "ok",None
     )
@@ -333,7 +333,7 @@ def run_stby(screen):
     screen.operator_event.wait()
     time.sleep(0.5)
     set_ch1_ch2_scale_10v(screen)
-    screen.log_signal.emit("headset adapter disconnected from HEADSET J25", False)
+    screen.log_signal.emit("headset adapter disconnected from HEADSET JACK 2", False)
     if STM32RelayController.send_with_retry(STM32RelayController.set_j24_on):
         screen.log_signal.emit("MIC OUT Connector J24 successfully  Connected", False)
     else:

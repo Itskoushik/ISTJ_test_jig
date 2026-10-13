@@ -35,6 +35,7 @@ class _SelfTestRefreshThread(QThread):
     """
     finished_ok = pyqtSignal(dict)
     failed = pyqtSignal(str)
+    searching = pyqtSignal()   # NEW — fired right before ISTJ CH3/COM initialization begins
 
     def __init__(self, monitor, worker):
         super().__init__()
@@ -52,31 +53,34 @@ class _SelfTestRefreshThread(QThread):
             if self._cancelled:
                 return
 
+            from devices.device_types import DeviceType
+            from devices.device_listeners import STM32Listener
+
             psu_inst = getattr(self.worker, "psu_inst", None)
-            mcu_ok = False
-            if psu_inst is not None:
-                # refresh_for_self_test() already resumed all listeners
-                # (incl. the live STM32 heartbeat listener) before returning.
-                # Re-pause everything before touching CH3 / the ISTJ COM port,
-                # otherwise this thread's unsync()/sync()/serial-open races
-                # the live listener for the same port and makes ISTJ flash
-                # "Not Connected" a few seconds after CH3 comes on.
+            # refresh_for_self_test() already did the authoritative CH3 +
+            # COM check and set this correctly — if it's already True, CH3
+            # was already ON and the port was already found, so there is
+            # nothing left to do (Case 1: don't touch CH3 at all).
+            mcu_ok = self.worker.device_status.get("Microcontroller", False)
+
+            if psu_inst is not None and not mcu_ok:
+                self.searching.emit()   # NEW — screen shows "Searching..." before any hardware touch
                 for lst in self.monitor._listeners:
                     try:
                         lst.pause()
                     except Exception:
                         pass
 
-                # Force a genuine power cycle: turn CH3 OFF first, then wait 1.5s
-                # before turning it back on.
                 try:
                     with self.monitor._psu_lock:
-                        psu_inst.write("INST:NSEL 3")
-                        time.sleep(0.1)
-                        psu_inst.write("OUTP OFF")
+                        ch3_state = psu_inst.query("OUTP? CH3").strip().upper()
                 except Exception:
-                    pass
-                for _ in range(15):          # 1.5s de-power wait, cancellable
+                    ch3_state = "0"
+
+                # Only power CH3 on if it's genuinely off. If it's already
+                # ON but the COM port just hasn't been found yet, leave it
+                # alone — do NOT turn it off and back on.
+                if ch3_state not in ("1", "ON"):
                     if self._cancelled:
                         for lst in self.monitor._listeners:
                             try:
@@ -84,13 +88,18 @@ class _SelfTestRefreshThread(QThread):
                             except Exception:
                                 pass
                         return
-                    time.sleep(0.1)
+                    turn_on_psu_channel(
+                        psu_inst, channel=3, voltage=5.0, current=1.0,
+                        psu_lock=self.monitor._psu_lock,
+                    )
 
-                turn_on_psu_channel(
-                    psu_inst, channel=3, voltage=5.0, current=1.0,
-                    psu_lock=self.monitor._psu_lock,
-                )
-                for _ in range(80):          # 8.0s in 0.1s slices — cancellable
+                self.monitor._remove_dead_listener(DeviceType.MCU)   # release the port before polling
+
+                # Poll for the COM port instead of blocking a fixed 8s —
+                # same 8.0s upper bound as before, but returns as soon as
+                # the port actually appears.
+                ser = None
+                for _ in range(80):
                     if self._cancelled:
                         for lst in self.monitor._listeners:
                             try:
@@ -98,30 +107,31 @@ class _SelfTestRefreshThread(QThread):
                             except Exception:
                                 pass
                         return
+                    ser = self.monitor._open_stm32_serial()
+                    if ser is not None:
+                        break
                     time.sleep(0.1)
 
-                from core.stm32_commands import STM32RelayController
-                from devices.device_types import DeviceType
-                self.monitor._remove_dead_listener(DeviceType.MCU)   # release the port before reopening it
-                ser = self.monitor._open_stm32_serial()
                 if ser is not None and not self._cancelled:
-                    ser.close()
-                    STM32RelayController.unsync()
-                    time.sleep(0.3)
-                    if not self._cancelled and STM32RelayController.sync():
+                    # COM visibility is sufficient for "Connected" — mirrors
+                    # DeviceMonitor._try_reconnect_stm32(), which intentionally
+                    # skips SYNC for this same reason.
+                    from core.stm32_commands import STM32RelayController
+                    if ser is not STM32RelayController._default_state_conn:
+                        # Only close+reopen a handle we independently
+                        # opened. If _open_stm32_serial() gave us
+                        # STM32RelayController's shared persistent
+                        # connection instead, closing it here would break
+                        # relay commands out from under it.
+                        ser.close()
+                        self.monitor._remove_dead_listener(DeviceType.MCU)
                         ser = self.monitor._open_stm32_serial()
-                        if ser is not None and not self._cancelled:
-                            from devices.device_types import DeviceType
-                            from devices.device_listeners import STM32Listener
-                            self.monitor._remove_dead_listener(DeviceType.MCU)
-                            self.monitor._start(
-                                STM32Listener(ser, psu_inst=psu_inst, psu_lock=self.monitor._psu_lock)
-                            )
-                            mcu_ok = True
+                    if ser is not None and not self._cancelled:
+                        self.monitor._start(
+                            STM32Listener(ser, psu_inst=psu_inst, psu_lock=self.monitor._psu_lock)
+                        )
+                        mcu_ok = True
 
-                # Resume everything else. If sync failed, the old MCU listener
-                # (never removed above) resumes too instead of being left
-                # paused forever.
                 for lst in self.monitor._listeners:
                     try:
                         lst.resume()
@@ -142,6 +152,16 @@ def except_hook(exctype, value, tb):
     traceback.print_exception(exctype, value, tb)
 
 sys.excepthook = except_hook
+
+import faulthandler
+from PyQt5.QtCore import qInstallMessageHandler
+_crash_log = open(Path.home() / "hal_crash.log", "a", buffering=1)
+faulthandler.enable(file=_crash_log, all_threads=True)
+
+def _qt_msg(mode, ctx, msg):
+    _crash_log.write(f"[Qt:{int(mode)}] {msg}\n")
+    _crash_log.flush()
+qInstallMessageHandler(_qt_msg)
 
 
 def shutdown_psu_ch3(existing_psu=None):
@@ -340,7 +360,9 @@ class HALApplication(QApplication):
     # ── Full test ─────────────────────────────────────────────────────────────
     def show_full_test(self):
         self._hide_current()
-        self._visited_test_mode = True
+        # Back/Abort shut PSU CH3 off, so Equipment Self Check must run the
+        # scan (CH3 on + ISTJ discovery) instead of the fast path.
+        self._visited_test_mode = False
         # Full test screen is heavy/stateful — always create fresh
         full_test_screen = FullTestScreen()
         full_test_screen.return_to_test_selection.connect(self.on_full_test_return)
@@ -364,8 +386,13 @@ class HALApplication(QApplication):
     # ── Equipment self check ──────────────────────────────────────────────────
 
     def show_equipment_self_check(self):
-        self._hide_current()
-        QApplication.processEvents()
+        # BEFORE: _hide_current() + processEvents() ran FIRST, so the previous
+        #         screen disappeared while Equipment Self Check was still
+        #         being built/blocking, exposing a blank window.
+        # AFTER:  remember the previous screen and keep it VISIBLE until the
+        #         new screen is fully constructed and painted.
+        prev_screen = self.current_screen
+
         worker = getattr(self._connection_screen, "worker", None)
         monitor = self._active_monitor
 
@@ -375,25 +402,42 @@ class HALApplication(QApplication):
             monitor.start_all(worker)
             self._active_monitor = monitor
 
-        # ── Capture BEFORE resetting. True means Single/Full Test just ran
-        #    and already power-cycled CH3, resynced ISTJ, and re-validated
-        #    PSU/DMM/Oscilloscope as part of its own pre-step. Redoing that
-        #    full CH3 OFF→ON + 8s boot-wait + ISTJ unsync/sync here is
-        #    pointless hardware churn — it's what makes the just-finished
-        #    test look like it's silently re-running.
         came_from_test_screen = self._visited_test_mode
         self._visited_test_mode = False
 
-        # ── Show the screen NOW with the last-known status (may be stale) —
-        #    the background thread below corrects each card in place within
-        #    a few seconds, instead of freezing the app while it scans.
+        # BEFORE: handles_alive()/refresh_from_worker() (blocking VISA queries
+        #         and listener waits) ran AFTER the window was already shown,
+        #         freezing it while blank.
+        # AFTER:  run them now, while the previous screen is still on display,
+        #         so the status snapshot below is already accurate.
+        fast_path = False
+        if (came_from_test_screen and monitor is not None and worker is not None
+                and monitor.handles_alive(worker)):
+            monitor.refresh_from_worker(worker)
+            fast_path = True
+
         initial_status = dict(worker.device_status) if worker is not None else dict(self.device_status)
         self.device_status = initial_status
 
-        equipment_screen = EquipmentSelfCheckScreen(
-            device_status=initial_status,
-            monitor=monitor,
-        )
+        # AFTER: build the screen without showing it. If construction fails,
+        #        keep the working previous screen visible and report it.
+        try:
+            equipment_screen = EquipmentSelfCheckScreen(
+                device_status=initial_status,
+                monitor=monitor,
+            )
+        except Exception as e:
+            traceback.print_exc()
+            print(f"[NAV] Equipment Self Check construction failed: {e}")
+            try:
+                QMessageBox.warning(
+                    prev_screen, "Equipment Self Check",
+                    f"Could not open Equipment Self Check:\n\n{e}",
+                )
+            except Exception:
+                pass
+            return   # prev_screen was never hidden
+
         equipment_screen.return_to_test_selection.connect(self.show_test_selection)
 
         if monitor is not None:
@@ -412,17 +456,20 @@ class HALApplication(QApplication):
             monitor._reconnect_timer.start()
             equipment_screen._monitor = monitor
 
-        equipment_screen.show()
+        # AFTER: the screen is fully built -> show it, let Qt run one
+        #        layout/paint pass, and only THEN hide the previous screen.
+        equipment_screen.showMaximized()
+        equipment_screen.raise_()
+        equipment_screen.activateWindow()
+        QApplication.processEvents()
+        if prev_screen is not None and prev_screen is not equipment_screen:
+            prev_screen.hide()
         self.current_screen = equipment_screen
 
-        # ── Coming back from Single/Full Test: just rebind listeners to
-        #    whatever instances worker currently holds — no CH3/ISTJ
-        #    power-cycle, no scanning-lock popup, no _SelfTestRefreshThread.
-        if came_from_test_screen:
-            if monitor is not None and worker is not None:
-                monitor.refresh_from_worker(worker)
-                self.device_status = dict(worker.device_status)
+        if fast_path:
+            self.device_status = dict(worker.device_status)
             return
+        # otherwise fall through to the background scan below
 
         # ── Otherwise this is a genuine fresh entry (e.g. straight from
         #    Connection or Test Selection with no test just run) — kick off
@@ -450,14 +497,35 @@ class HALApplication(QApplication):
             # thread's own CH3/ISTJ sequence has fully finished.
             monitor._reconnect_timer.stop()
 
-            self._self_test_refresh_thread = _SelfTestRefreshThread(monitor, worker)
-            self._self_test_refresh_thread.finished_ok.connect(
+            thread = _SelfTestRefreshThread(monitor, worker)
+            self._self_test_refresh_thread = thread
+            print("[THREAD] SelfTestRefresh CREATED")
+            thread.finished_ok.connect(
                 lambda status: self._on_self_test_refresh_done(equipment_screen, initial_status, status)
             )
-            self._self_test_refresh_thread.failed.connect(
+            thread.failed.connect(
                 lambda err: self._on_self_test_refresh_failed(equipment_screen, err)
             )
-            self._self_test_refresh_thread.start()
+            thread.searching.connect(
+                lambda: equipment_screen.set_istj_searching()
+                
+            )
+            # Qt's own `finished` signal is the ONLY thing allowed to
+            # clear self._self_test_refresh_thread — never a bounded
+            # wait() timeout. Guarded by identity so a stale/replaced
+            # thread's finished signal can't null out a newer one.
+            thread.finished.connect(lambda: self._on_refresh_thread_finished(thread))
+            thread.start()
+            print("[THREAD] SelfTestRefresh STARTED")
+            
+    def _on_refresh_thread_finished(self, thread):
+        print("[THREAD] SelfTestRefresh FINISHED")
+        if thread is not self._self_test_refresh_thread:
+            return   # a newer thread has already replaced this one
+        if thread.isRunning():
+            return   # finished signal fired but isRunning() still true — shouldn't
+                      # happen, but never null a possibly-live reference
+        self._self_test_refresh_thread = None
 
     def _on_self_test_refresh_done(self, screen, old_status, new_status):
         self.device_status = dict(new_status)
@@ -479,6 +547,7 @@ class HALApplication(QApplication):
                 return
 
         # ── Scan is done — unlock Run Self Test buttons, respecting the
+        
         #    just-updated per-device connected state (not unconditionally).
         try:
             screen.set_scanning_lock(False)
@@ -490,8 +559,10 @@ class HALApplication(QApplication):
         #    take over disconnect recovery again without racing anything.
         if self._active_monitor is not None:
             self._active_monitor._reconnect_timer.start()
-
-        self._self_test_refresh_thread = None
+        # self._self_test_refresh_thread clearing is now owned exclusively
+        # by _on_refresh_thread_finished (Qt's `finished` signal) — do not
+        # duplicate it here to avoid racing/clearing a thread object that
+        # technically hasn't emitted `finished` yet at this exact instant.
 
     def _on_self_test_refresh_failed(self, screen, error_message: str):
         """
@@ -499,7 +570,7 @@ class HALApplication(QApplication):
         leaving the screen stuck showing pre-scan status with no
         indication anything went wrong.
         """
-        self._self_test_refresh_thread = None
+        # Reference clearing owned by _on_refresh_thread_finished, not here.
         if self.current_screen is not screen:
             return
 

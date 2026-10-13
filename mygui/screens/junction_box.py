@@ -676,13 +676,22 @@ class JunctionBoxUI(QMainWindow):
             ).exec_()
             return
         from screens.single_test_interface import SingleTestScreen
+        old = getattr(self, "single_test", None)
+        if old is not None:
+            try:
+                old._stop_all_background_threads()
+            except Exception:
+                pass
         self.single_test = SingleTestScreen(
             selected_tests=selected_tests,
             previous_screen=self,
             entry_mode="junction",
-            selected_connectors=selected_connectors   # NEW
+            selected_connectors=selected_connectors
         )
         self.single_test.return_to_test_selection.connect(self.show)
+        app = QApplication.instance()
+        if hasattr(app, "on_disconnect_return"):
+            self.single_test.return_to_connection.connect(app.on_disconnect_return)
         self.single_test.show()
         self.hide()
 

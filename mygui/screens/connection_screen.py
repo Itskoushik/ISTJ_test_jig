@@ -330,22 +330,9 @@ class ConnectionScreen(QMainWindow):
             self.logout_requested.emit()     # ← just emit, let HALApplication handle it
             self.close()
 
-    def worker_ch3_5v(self):
-        self.psu_send_command("*CLS")
-        self.psu_send_command("INST:NSEL 3")
-        time.sleep(0.1)
-
-        self.psu_send_command("SOUR3:VOLT 5.0")
-        self.psu_send_command("SOUR3:CURR 0.5")
-
-        self.psu_send_command("OUTP ON")
-        time.sleep(0.5)   # ⏳ let PSU settle
-        self.start_voltage_monitoring()
-        self.current_channel = 3
-        self.log_signal.emit("Ch3 OUTPUT ON (5V, 0.5A)", False)
     def start_retry_cycle(self):
         self.connection_in_progress = True
-        self.logout_btn.setEnabled(True)
+        self.logout_btn.setEnabled(False)
         self.connect_btn.setEnabled(False)
         self.retry_seconds = 10
         self.connect_btn.setText("Retrying in 10s")
@@ -364,6 +351,7 @@ class ConnectionScreen(QMainWindow):
                 self.connection_in_progress = False
                 self.connect_btn.setText("CONNECT")
                 self.connect_btn.setEnabled(True)
+                self.logout_btn.setEnabled(True)
                 self.log_text.append("Max retries reached.")
                 return
 

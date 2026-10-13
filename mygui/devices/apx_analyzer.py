@@ -276,24 +276,21 @@ def configure_apx_jb(self):
     return True
 
 def _reconnect_apx(self, is_junction_box: bool, attempt: int) -> bool:
-    self.log_signal.emit(f"⚠ apx crash detected (attempt {attempt}) — restarting APx500…", True)
-    # ── Step 0: operator dismissal popup is now handled by the caller
-    #    (_on_apx_crash) before this function is ever called.
-    #    We just kill the process directly here. ────────────────────────
+    print(f"[APX RECOVERY] crash detected (attempt {attempt}) — restarting APx500…")
     try:
         kill_apx()
-        self.log_signal.emit("APx500 process killed.", False)
+        print("[APX RECOVERY] APx500 process killed.")
     except Exception as e:
-        self.log_signal.emit(f"kill_apx warning: {e}", True)
+        print(f"[APX RECOVERY] kill_apx warning: {e}")
     time.sleep(5)
     try:
         ok, _ = connect_apx(log_callback=None)
         if not ok:
-            self.log_signal.emit("apx reconnect: connect_apx returned False", True)
+            print("[APX RECOVERY] connect_apx returned False")
             return False
-        self.log_signal.emit("APx500 relaunched ✅", False)
+        print("[APX RECOVERY] APx500 relaunched")
     except Exception as e:
-        self.log_signal.emit(f"apx reconnect failed — {e}", True)
+        print(f"[APX RECOVERY] reconnect failed — {e}")
         return False
 
     time.sleep(2)
@@ -307,15 +304,16 @@ def _reconnect_apx(self, is_junction_box: bool, attempt: int) -> bool:
             label = "Station Box (50 Ω)"
 
         if not ok:
-            self.log_signal.emit(f"apx reconfigure ({label}) failed.", True)
+            print(f"[APX RECOVERY] reconfigure ({label}) failed.")
             return False
 
-        self.log_signal.emit(f"apx reconfigured for {label}. Resuming test…", False)
+        print(f"[APX RECOVERY] reconfigured for {label}. Resuming test…")
         return True
 
     except Exception as e:
-        self.log_signal.emit(f"apx reconfigure error: {e}", True)
-        return False    
+        print(f"[APX RECOVERY] reconfigure error: {e}")
+        return False
+        
 def _reconnect_apx_with_retry(self, is_junction_box: bool,
                                max_attempts: int = 10) -> bool:
     """
@@ -877,12 +875,18 @@ def read_apx_thd_freq(self, label="Audio Analyser Reading",
         time.sleep(1.0)   # settle before reading
         time.sleep(0.8)
 
+        _CRASH_LOCAL = ("SystemUnstableError", "APError", "APException",
+                         "TrackingServerSink", "The system has encountered an error")
+
         # ── THD+N ────────────────────────────────────────────────────────
         thd = None
         try:
             thd_list = list(apx.BenchMode.Meters.GetReadings(BenchModeMeterType.ThdNRatioMeter))
             thd = float(thd_list[0])
         except Exception as e:
+            if any(s in str(e) for s in _CRASH_LOCAL):
+                raise   # let the outer except (and the recovery wrapper) handle it cleanly
+            print(f"THD+N read error: {e}")
             self.log_signal.emit(f"THD+N read error: {str(e)}", True)
 
         # ── Frequency ────────────────────────────────────────────────────
@@ -891,6 +895,9 @@ def read_apx_thd_freq(self, label="Audio Analyser Reading",
             freq_list = list(apx.BenchMode.Meters.GetReadings(BenchModeMeterType.FrequencyMeter))
             frequency = float(freq_list[0])
         except Exception as e:
+            if any(s in str(e) for s in _CRASH_LOCAL):
+                raise
+            print(f"Frequency read error: {e}")
             self.log_signal.emit(f"Frequency read error: {str(e)}", True)
 
         # --- turn generator OFF after all readings done ---

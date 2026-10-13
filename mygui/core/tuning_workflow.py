@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFrame, QApplication
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal, QThread
 from PyQt5.QtGui  import QFont
 
 from dialogs.tuning_popup import TuningPopup
@@ -147,8 +147,15 @@ class TuningOrSkipPopup(QDialog):
 # Coordinator — all Qt interaction on main thread via QTimer
 # =============================================================================
 
-class TuningCoordinator:
+_RETIRED = []   # keeps a coordinator alive until its queued stop runs on the GUI thread
+
+
+class TuningCoordinator(QObject):
+    _stop_sig = pyqtSignal()
+
     def __init__(self, screen):
+        super().__init__()
+        self._stop_sig.connect(self._stop_main)
         self.screen = screen
         self._label = ""; self._unit = "voltage"
         self._min = None; self._max = None
@@ -168,18 +175,28 @@ class TuningCoordinator:
         self._update_status = ""
         self._last_forced_value = None
 
-        self._timer = QTimer()
+        self._timer = QTimer(self)
         self._timer.setInterval(50)
         self._timer.timeout.connect(self._tick)
         self._timer.start()
 
     # bg-thread API
+    def _aborting(self):
+        return self.screen.abort_event.is_set()
+
+    def _abort_pending(self):
+        ev = getattr(self.screen, "_abort_pending_event", None)
+        return ev is not None and not ev.is_set()
+
     def ask_decision(self, label, unit, min_val, max_val):
         self._label = label; self._unit = unit
         self._min = min_val; self._max = max_val
         self._decision_done.clear()
         self._decision_req.set()
-        self._decision_done.wait()
+        while not self._decision_done.wait(0.1):
+            if self._aborting():
+                self._decision_req.clear()
+                return "skip"
         return self._decision_choice
 
     def open_tuning(self, label, unit, min_val, max_val):
@@ -194,28 +211,56 @@ class TuningCoordinator:
         self._update_req.set()
 
     def wait_tuning_done(self):
-        self._tuning_done.wait()
+        while not self._tuning_done.wait(0.1):
+            if self._aborting():
+                return
 
     def close_tuning(self):
         self._tuning_close.set()
 
     def stop(self):
+        """Safe from any thread: GUI work is always done on the GUI thread."""
+        if QThread.currentThread() is QApplication.instance().thread():
+            self._stop_main()
+        else:
+            _RETIRED.append(self)
+            self._stop_sig.emit()
+
+    def _stop_main(self):
         self._timer.stop()
         for p in [self._decision_popup, self._tuning_popup]:
             if p is not None:
                 try: p.close()
                 except RuntimeError: pass
         self._decision_popup = None; self._tuning_popup = None
+        self._decision_done.set(); self._tuning_done.set()
+        if self in _RETIRED:
+            _RETIRED.remove(self)
 
     # main-thread poll
     def _tick(self):
+        # ── Abort running: never open anything, close what's open, release waiters ──
+        if self._aborting():
+            for p in (self._decision_popup, self._tuning_popup):
+                if p is not None:
+                    try: p.reject()
+                    except RuntimeError: pass
+            self._tuning_popup = None
+            self._decision_req.clear(); self._tuning_open_req.clear()
+            self._decision_choice = "skip"
+            self._decision_done.set(); self._tuning_done.set()
+            return
+        # ── Abort confirmation is open: keep requests queued, open nothing ──
+        if self._abort_pending():
+            return
+
         if self._decision_req.is_set() and self._decision_popup is None:
             self._decision_req.clear()
             popup = TuningOrSkipPopup(self._label, parent=self.screen, section_title=_popup_section_title)
             popup.setWindowModality(Qt.ApplicationModal)
             self._decision_popup = popup
             popup.exec_()
-            self._decision_choice = popup.get_choice()
+            self._decision_choice = "skip" if self._aborting() else popup.get_choice()
             self._decision_popup = None
             self._decision_done.set()
 
@@ -250,6 +295,10 @@ class TuningCoordinator:
                 self._tuning_popup = None
 
     def _on_tuning_done(self):
+        if self._aborting():
+            self._last_forced_value = None
+            self._tuning_done.set()
+            return
         # Capture forced value before _tick clears _tuning_popup
         self._last_forced_value = None
         if self._tuning_popup is not None:
@@ -346,6 +395,7 @@ def _handle_fail(original_fn, unit, label, min_val, max_val,
         return original_result
 
     choice = coord.ask_decision(label, unit, min_val, max_val)
+    screen.check_abort()   # abort during the decision popup -> unwind, don't continue
     if choice == "skip":
         screen.log_signal.emit(f"⏭ Skipping tuning for [{label}]", False)
         return original_result
@@ -369,7 +419,8 @@ def _handle_fail(original_fn, unit, label, min_val, max_val,
     is_apx = unit not in ("voltage", "resistance")
 
     def _live_loop():
-        while not stop_live.is_set() and not coord._tuning_done.is_set():
+        while (not stop_live.is_set() and not coord._tuning_done.is_set()
+               and not screen.abort_event.is_set()):
             val = _live_read_apx(unit) if is_apx else _live_read_dmm(unit)
             if val is not None:
                 display = (_fmt_apx(val, unit) if is_apx
@@ -383,10 +434,11 @@ def _handle_fail(original_fn, unit, label, min_val, max_val,
     t.start()
     coord.wait_tuning_done()
     stop_live.set(); t.join(timeout=1.0)
+    coord.close_tuning()
+    screen.check_abort()   # aborted while tuning: stop here, no retry, no generator calls
 
     # ── Check if operator used Ctrl+F Force Pass ──────────────────────────
     forced = coord._last_forced_value
-    coord.close_tuning()
 
     if forced is not None:
         if unit == "voltage":

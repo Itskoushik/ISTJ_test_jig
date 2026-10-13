@@ -40,14 +40,15 @@ def _run_ch1_relay_voltage_test(screen):
 
     # ── Step 1: PSU CH1 ON at 7V / 1A ────────────────────────────────────
     _psu_ch1_apply(screen, 7.0, 1.0)
-    time.sleep(1.0)
+    screen.check_abort()
+    screen.abortable_sleep(1.0)
 
     # ── Turn on S23, S21, then J30 ────────────────────────────────────────
-    s23_ok = STM32RelayController.send_with_retry(STM32RelayController.set_s23_remote)
+    s23_ok = STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s23_remote)
     time.sleep(0.3)
-    s21_ok = STM32RelayController.send_with_retry(STM32RelayController.set_s21_on)
+    s21_ok = STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s21_on)
     time.sleep(0.3)
-    j30_ok = STM32RelayController.send_with_retry(STM32RelayController.set_j30_on)
+    j30_ok = STM32RelayController.send_with_retry_self_test(STM32RelayController.set_j30_on)
     time.sleep(1.0)
 
     if s23_ok:
@@ -69,45 +70,52 @@ def _run_ch1_relay_voltage_test(screen):
 
     write_self_test_excel("F29", "CONNECTED" if relays_ok else "FAILED")
 
-    time.sleep(0.5)
+    screen.abortable_sleep(0.5)
     result = _dmm_module.read_voltage_for_self_test(screen, "DMM Voltage Check", "6.0V", "8.0V")
     if result:
         write_self_test_excel("H29", result["observation"])
         write_self_test_excel("I29", result["result"])
-    time.sleep(1.0)
+    screen.check_abort()
+    screen.abortable_sleep(1.0)
 
     # ── Step 2: PSU CH1 → 14V / 1A ────────────────────────────────────────
     _psu_ch1_apply(screen, 14.0, 1.0)
-    time.sleep(1.0)
+    screen.abortable_sleep(1.0)
     result = _dmm_module.read_voltage_for_self_test(screen, "DMM Voltage Check", "13.0V", "15.0V")
     if result:
         write_self_test_excel("H32", result["observation"])
         write_self_test_excel("I32", result["result"])
-    time.sleep(1.0)
+    screen.check_abort()
+    screen.abortable_sleep(1.0)
 
     # ── Step 3: PSU CH1 → 28V / 1A ────────────────────────────────────────
     _psu_ch1_apply(screen, 28.0, 1.0)
-    time.sleep(1.0)
+    screen.abortable_sleep(1.0)
     result = _dmm_module.read_voltage_for_self_test(screen, "DMM Voltage Check", "27.0V", "29.0V")
     if result:
         write_self_test_excel("H35", result["observation"])
         write_self_test_excel("I35", result["result"])
-    time.sleep(1.0)
+    screen.check_abort()
+    screen.abortable_sleep(1.0)
 
     # ── Turn OFF all relays, then PSU CH1 ─────────────────────────────────
-    if STM32RelayController.send_with_retry(STM32RelayController.set_j30_off):
+    # NOTE: intentionally NOT abort-checked from here down — once an abort
+    # is caught, we still want relays/PSU CH1 turned off below rather than
+    # leaving hardware energized (see run() below, which routes both the
+    # normal and aborted paths through this same shutdown tail).
+    if STM32RelayController.send_with_retry_self_test(STM32RelayController.set_j30_off):
         screen.log_signal.emit("J30 successfully disconnected", False)
     else:
         screen.log_signal.emit("ERROR: Failed to disconnect J30", True)
     time.sleep(0.3)
 
-    if STM32RelayController.send_with_retry(STM32RelayController.set_s21_off):
+    if STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s21_off):
         screen.log_signal.emit("S21 successfully set to DOWN position", False)
     else:
         screen.log_signal.emit("ERROR: Failed to set S21 to DOWN position", True)
     time.sleep(0.3)
 
-    if STM32RelayController.send_with_retry(STM32RelayController.set_s23_local):
+    if STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s23_local):
         screen.log_signal.emit("S23 successfully set to LOCAL", False)
     else:
         screen.log_signal.emit("ERROR: Failed to set S23 to LOCAL", True)
@@ -144,7 +152,7 @@ def _relay_send(screen, cmd_name: str, relay_history: list, *, retry_on_fail: bo
     Returns True if the command ultimately succeeded, False otherwise.
     """
     fn = _RELAY_CMD_MAP[cmd_name]
-    ok = STM32RelayController.send_with_retry(fn)
+    ok = STM32RelayController.send_with_retry_self_test(fn)
 
     if ok:
         relay_history.append(cmd_name)
@@ -153,17 +161,30 @@ def _relay_send(screen, cmd_name: str, relay_history: list, *, retry_on_fail: bo
     if not retry_on_fail:
         return False
 
+    # Abort takes priority over recovery — do not start a CH3 power-cycle
+    # and relay replay sequence that will just have to be unwound.
+    if getattr(screen, "abort_event", None) is not None and screen.abort_event.is_set():
+        print(f"[RECOVERY] Relay '{cmd_name}' failed — abort requested, skipping recovery")
+        return False
+
     # ── Recovery: CH3 power-cycle + STM32 sync ───────────────────────────────
     print(f"[RECOVERY] Relay '{cmd_name}' failed — power-cycling CH3 and replaying state...")
 
     _ch3_power_cycle(screen)
     _stm32_sync_wait(screen)
 
+    if getattr(screen, "abort_event", None) is not None and screen.abort_event.is_set():
+        print("[RECOVERY] Abort requested mid-recovery — skipping relay replay")
+        return False
+
     # Replay all previously successful commands
     print(f"[RECOVERY] Replaying {len(relay_history)} prior relay command(s)...")
     for prev_cmd in relay_history:
+        if getattr(screen, "abort_event", None) is not None and screen.abort_event.is_set():
+            print("[RECOVERY] Abort requested during replay — stopping replay early")
+            return False
         prev_fn = _RELAY_CMD_MAP[prev_cmd]
-        rep_ok = STM32RelayController.send_with_retry(prev_fn)
+        rep_ok = STM32RelayController.send_with_retry_self_test(prev_fn)
         status = "✓" if rep_ok else "✗ (non-fatal)"
         print(f"[RECOVERY]   {prev_cmd} → {status}")
         time.sleep(0.3)
@@ -206,7 +227,7 @@ def _stm32_sync_wait(screen):
     print("[RECOVERY] Syncing STM32...")
     for attempt in range(3):
         try:
-            ok = STM32RelayController.send_with_retry(STM32RelayController.sync)
+            ok = STM32RelayController.send_with_retry_self_test(STM32RelayController.sync)
             if ok:
                 print("[RECOVERY] STM32 sync confirmed ✓")
                 time.sleep(1.0)
@@ -220,6 +241,8 @@ def _stm32_sync_wait(screen):
 # ── Main test ─────────────────────────────────────────────────────────────────
 
 def run(screen):
+    from core.test_abort import TestAbortRequested
+
     set_ch1_ch2_scale_10v(screen)
     screen.log_signal.emit("==========COMMENCING PSU (POWER SUPPLY UNIT) SELF TEST===========", False)
 
@@ -229,8 +252,23 @@ def run(screen):
         str(RESOURCES_DIR / "self_test.jpeg")   # empty string "" if no image
     )
     screen._operator_event.wait()
+    screen.check_abort()   # operator may have aborted instead of clicking OK
 
     # ── CH1 relay + voltage test (S23/S21/J30 @ 7V/14V/28V) ─────────────
-    _run_ch1_relay_voltage_test(screen)
+    try:
+        _run_ch1_relay_voltage_test(screen)
+    except TestAbortRequested:
+        # Hardware-safety tail still needs to run even on abort — relays
+        # and PSU CH1 must not be left energized just because the
+        # operator cancelled mid-test.
+        screen.log_signal.emit("[ABORT] PSU self test cancelled — powering down relays/CH1...", False)
+        try:
+            STM32RelayController.send_with_retry_self_test(STM32RelayController.set_j30_off)
+            STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s21_off)
+            STM32RelayController.send_with_retry_self_test(STM32RelayController.set_s23_local)
+        except Exception:
+            pass
+        _psu_ch1_off(screen)
+        raise
 
     screen.log_signal.emit("==========SUCCESSFULLY COMPLETED PSU (POWER SUPPLY UNIT) SELF TEST===========", False)

@@ -3,7 +3,6 @@ from PyQt5.QtCore import pyqtSignal, Qt
 from PyQt5.QtGui import *
 from PyQt5.QtCore import QSize , QTimer
 from core.screen_utils import sp, responsive_size, responsive_geometry
-from matplotlib.pylab import outer
 from screens.lru_selection import Singletestselection
 from core.paths import RESOURCES_DIR, PDF_TEST_REPORTS_DIR
 from screens.test_reports_screen import EmptyStateDialog
@@ -639,10 +638,9 @@ class TestSelectionScreen(QMainWindow):
                 psu_inst.close()
             except Exception:
                 pass
-        if rm:
-            try:
-                rm.close()
-            except Exception:
-                pass
+        # never rm.close(): pyvisa's ResourceManager is process-wide and closing it
+        # would kill the PSU/DMM/scope sessions owned by the connection screen's worker.
+        # Just drop this local reference.
+        rm = None
 
         return shutdown_ok

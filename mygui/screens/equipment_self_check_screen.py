@@ -1,7 +1,7 @@
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
-from core.paths import RESOURCES_DIR, CALIBRATION_LOGS_DIR
+from core.paths import RESOURCES_DIR, CALIBRATION_LOGS_DIR, EQUIPMENT_CHECK_LOGS_DIR,SELF_TEST_REPORTS_DIR
 from core.logger import Logger
 from datetime import datetime, date, time
 import sqlite3
@@ -14,7 +14,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.lib import colors
 from db.db_paths import CALIBRATION_DB_PATH
-from core.paths import SELF_TEST_REPORTS_DIR,LOGS_PDF_DIR,LOGS_SELF_TEST_DIR
+
 from screens.test_reports_screen import TestReportsScreen
 from core.calibration_report import generate_and_print_calibration_report, CalibrationReportError   
 from tests import self_audio_analyser,self_istj,self_dmm,self_oscilloscope,self_psu,self_ethernet,self_rs232,self_rs422
@@ -22,11 +22,15 @@ from threading import Event
 from dialogs.OperatorInfoPopup import OperatorInfoPopup
 from psu.psu_automation import PSUAutomation
 from psu.self_test_psu_host import SelfTestPSUHost
+from psu.psu_helpers import turn_off_psu_channel
 import time as _time
 from pathlib import Path 
 from screens.test_reports_screen import TestReportsScreen, EmptyStateDialog
 from devices.device_types import DeviceType
+# after
 from devices.oscilloscope_connection import OscilloscopeConnection
+from core.stm32_commands import STM32RelayController, RelayStateTracker
+from core.test_abort import TestAbortRequested
 
 _DEVICE_REPORT_NAME_MAP = {
     "PSU (Power Supply)":       "PSU_POWER_SUPPLY",
@@ -124,6 +128,7 @@ class EquipmentSelfCheckScreen(QMainWindow):
     def __init__(self, device_status: dict, monitor=None):
         super().__init__()
         self._monitor = monitor
+        self._nav_cleanup_done = False
         # device_status is now already the authoritative post-scan snapshot
         # built by HALApplication.show_equipment_self_check() from
         # worker.device_status, after DeviceMonitor.refresh_for_self_test()
@@ -163,9 +168,14 @@ class EquipmentSelfCheckScreen(QMainWindow):
         from core.screen_utils import responsive_size
         self.setMinimumSize(responsive_size(0.55, 0.6, min_w=900, min_h=650))
         self.setStyleSheet("background-color: #f5f5f5;")
-        self.showMaximized()
+        # BEFORE: showMaximized() was called here, before any widget existed,
+        #         so a maximized blank white window could be exposed while the
+        #         rest of __init__ was still building the UI.
+        # AFTER:  the screen is never shown from its constructor. The caller
+        #         (HALApplication.show_equipment_self_check) shows it only
+        #         once construction has fully completed.
 
-        self.logger = Logger(CALIBRATION_LOGS_DIR / f"equipment_check_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        self.logger = Logger(EQUIPMENT_CHECK_LOGS_DIR / f"equipment_check_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -1185,6 +1195,13 @@ class EquipmentSelfCheckScreen(QMainWindow):
         layout.addLayout(button_layout)
 
         return card
+    # Display-only override for the reconnect popup — the underlying key
+    # used for device_status / findChild lookups everywhere else stays
+    # "Microcontroller" unchanged, so nothing else has to be touched.
+    _RECONNECT_DISPLAY_NAMES = {
+        "Microcontroller": "ISTJ CONTROLLER",
+    }
+
     def on_device_reconnected(self, ui_name: str):
         """
         Called when DeviceMonitor detects a previously disconnected device is back.
@@ -1218,14 +1235,14 @@ class EquipmentSelfCheckScreen(QMainWindow):
             
         # ── Update header status badge ────────────────────────────────────
         self._refresh_header_badge()
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Device Reconnected")
-        msg.setIcon(QMessageBox.Information)
-        msg.setText(f"<b>{ui_name}</b> has been reconnected.")
-        msg.setInformativeText("The device is online and ready.")
-        msg.setStandardButtons(QMessageBox.Ok)
-        msg.setModal(False)
-        msg.show()
+        display_name = self._RECONNECT_DISPLAY_NAMES.get(ui_name, ui_name)
+        toast = DisconnectToast(
+            f"{display_name} Reconnected",
+            "The device is online and ready.",
+            parent=self,
+            severity="info",
+        )
+        toast.show()
     def on_run_device_self_test(self, device_name: str, test_result_label: QLabel = None, last_test_key: str = None):
         dialog = SelfTestDialog(device_name, self, display_name=last_test_key)
         self._active_self_test_dialogs.append(dialog)
@@ -1363,83 +1380,173 @@ class EquipmentSelfCheckScreen(QMainWindow):
             QMessageBox.Ok
         )
 
-    # AFTER
-    def on_back_clicked(self):
-        self.logger.log("Returning to Test Selection from Equipment Self Check", False)
+    def _has_running_self_test(self) -> bool:
+        """True if any tracked SelfTestDialog's worker is still running and
+        hasn't already been told to abort. Used to gate navigation away
+        from this screen — without this check, clicking Back or closing
+        the window silently aborts a running test via
+        _perform_leave_cleanup() -> _begin_cooperative_abort(), with no
+        confirmation, because that path bypasses SelfTestDialog's own
+        closeEvent() confirm prompt entirely."""
+        for dlg in list(getattr(self, "_active_self_test_dialogs", [])):
+            try:
+                worker = getattr(dlg, "_worker", None)
+                if worker is not None and worker.isRunning() and not getattr(dlg, "_abort_requested", False):
+                    return True
+            except RuntimeError:
+                pass   # dialog already destroyed
+        return False
 
-        # ── Cancel any in-flight background refresh FIRST — otherwise it
-        #    can still call turn_on_psu_channel(CH3)/start a new
-        #    STM32Listener after the PSU-off write below, re-powering CH3
-        #    right after we've explicitly shut it down.
+    def _perform_leave_cleanup(self):
+        """
+        Cancel the refresh thread and shut PSU CH1/2/3 off exactly once.
+        on_back_clicked() -> close() -> closeEvent() can both reach here on a
+        single Back click; the _nav_cleanup_done instance guard makes the
+        second call a no-op. That guard is the ONLY guard needed — the call
+        graph has no third caller, and a process-wide timestamp guard would
+        wrongly suppress a legitimate shutdown on a fast re-entry.
+        """
+        if getattr(self, '_nav_cleanup_done', False):
+            return
+        self._nav_cleanup_done = True
+
+        # ── Any SelfTestDialog still running owns CH1/CH2/CH3 and relay
+        # state right now. Request cooperative abort on each and wait for
+        # its worker to actually finish BEFORE this method forces PSU
+        # channels off below — otherwise leave-cleanup and an in-flight
+        # self-test both drive the same hardware concurrently.
+        for dlg in list(getattr(self, "_active_self_test_dialogs", [])):
+            try:
+                worker = getattr(dlg, "_worker", None)
+                if worker is not None and worker.isRunning():
+                    if not getattr(dlg, "_abort_requested", False):
+                        dlg._begin_cooperative_abort()
+                    worker.wait(15000)
+                    if worker.isRunning():
+                        self.logger.log(
+                            "Active self-test worker did not stop within 15s on "
+                            "navigation — deferring PSU shutdown to avoid racing it.",
+                            True,
+                        )
+                        return
+                    # SELF-TEST ABORT SAFETY: worker has fully stopped -> OFF every
+                    # relay registered for its test (shows the progress dialog).
+                    dlg._run_abort_relay_cleanup()
+            except RuntimeError:
+                pass   # dialog already destroyed
+
+        # ── Cancel the background refresh AND WAIT
+        #    cancel() only sets a flag. If we proceed while the thread is
+        #    inside (or about to enter) turn_on_psu_channel(), it blocks on
+        #    _psu_lock while we shut the channels off, then writes OUTP ON
+        #    the instant we release the lock — leaving CH3 energized after
+        #    the operator has already returned to Test Selection.
         app_instance = QApplication.instance()
         refresh_thread = getattr(app_instance, "_self_test_refresh_thread", None)
+        refresh_thread_stuck = False
         if refresh_thread is not None:
-            refresh_thread.cancel()
+            try:
+                refresh_thread.cancel()
+                if refresh_thread.isRunning():
+                    for _ in range(20):   # 20 x 500ms = 10s bound, GUI stays responsive
+                        QApplication.processEvents()
+                        if refresh_thread.wait(500):
+                            break
+                if refresh_thread.isRunning() and True:
+                    self.logger.log(
+                        "Refresh thread did not exit within 10s — it owns the "
+                        "reference and will clear itself via QThread.finished; "
+                        "deferring PSU shutdown to avoid racing it.",
+                        True,
+                    )
+                    refresh_thread_stuck = True
+                # NOTE: never set app_instance._self_test_refresh_thread = None
+                # here. Ownership belongs exclusively to
+                # HALApplication._on_refresh_thread_finished, which only
+                # clears it once QThread.finished has actually fired.
+            except RuntimeError:
+                pass   # thread wrapper already destroyed
+
+        if refresh_thread_stuck:
+            # The refresh thread may still be touching CH3/ISTJ — do NOT
+            # also command PSU shutdown concurrently from here. Listener
+            # pause/PSU-off will be retried the next time this screen is
+            # entered/left; skip the rest of this cleanup pass safely.
+            return
 
         if hasattr(self, '_monitor') and self._monitor:
             self._monitor._reconnect_timer.stop()
+
+            # PSU/MCU listeners are fully REMOVED, not merely stopped:
+            # _remove_dead_listener() also closes the MCU serial handle, so
+            # the ISTJ COM port is released here instead of staying OS-locked
+            # by a finished thread until refcount GC happens to collect it.
+            self._monitor._remove_dead_listener(DeviceType.PSU)
+            self._monitor._remove_dead_listener(DeviceType.MCU)
             for lst in self._monitor._listeners:
                 try:
                     lst.pause()
                 except Exception:
                     pass
 
-            worker = getattr(self._monitor, "_worker", None)
-            psu_inst = getattr(worker, "psu_inst", None) if worker else None
-            if psu_inst is not None:
-                from psu.psu_helpers import turn_off_all_psu_channels
-                turn_off_all_psu_channels(psu_inst, psu_lock=self._monitor._psu_lock)
-                self.logger.log("PSU CH1/CH2/CH3 OFF on leaving Equipment Self Check", False)
+            # NORMAL NAVIGATION: do NOT switch PSU CH1/CH2/CH3 off here.
+            # Any running test was already cooperatively aborted above (its
+            # worker turns CH1/CH2 off on abort and the abort relay cleanup
+            # OFFs the test's relays). Forcing CH3 off on plain navigation
+            # only power-cycled the ISTJ board for no reason. App quit still
+            # shuts every PSU channel via HALApplication._trigger_psu_shutdown.
 
+    def on_back_clicked(self):
+        if self._has_running_self_test():
+            reply = QMessageBox.question(
+                self, "Self Test Running",
+                "A self test is currently running.\n\n"
+                "Going back will abort it. Are you sure you want to continue?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+        self.logger.log("Returning to Test Selection from Equipment Self Check", False)
+        self._perform_leave_cleanup()
         self.return_to_test_selection.emit()
         self.close()
 
     def closeEvent(self, event):
-        """
-        Handles the OS/title-bar 'X' close — on_back_clicked() only runs for
-        the in-app Back button, so without this override, closing via 'X'
-        skips stopping _reconnect_timer and the listener QThreads. Those
-        threads keep polling/writing the same PSU VISA handle that
-        aboutToQuit's shutdown_psu_ch3() then tries to write to concurrently,
-        which is the same PSU-handle race _pre_step_ch3_and_sync() warns
-        about elsewhere in this file — it can make the CH1-3 OFF write on
-        quit silently fail, hang, or race, and leaves the QThreads running
-        un-stopped underneath the closing window.
-        Mirrors on_back_clicked()'s cleanup so both exit paths behave the
-        same way before the window (and, being the last visible top-level
-        window, the whole app via quitOnLastWindowClosed) actually closes.
-        """
-        # ── Cancel any in-flight background refresh FIRST — same reasoning
-        #    as on_back_clicked(): without this, the refresh thread can
-        #    still power CH3 back on / start a new STM32Listener after this
-        #    method has already turned the PSU off.
-        app_instance = QApplication.instance()
-        refresh_thread = getattr(app_instance, "_self_test_refresh_thread", None)
-        if refresh_thread is not None:
-            refresh_thread.cancel()
-
+        """..."""  # (docstring unchanged)
+        if self._has_running_self_test():
+            reply = QMessageBox.question(
+                self, "Self Test Running",
+                "A self test is currently running.\n\n"
+                "Closing this window will abort it. Are you sure you want to continue?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+        self._perform_leave_cleanup()
         if hasattr(self, '_monitor') and self._monitor:
-            self._monitor._reconnect_timer.stop()
-            for lst in self._monitor._listeners:
-                try:
-                    lst.pause()
-                except Exception:
-                    pass
-
-            worker = getattr(self._monitor, "_worker", None)
-            psu_inst = getattr(worker, "psu_inst", None) if worker else None
-            if psu_inst is not None:
-                from psu.psu_helpers import turn_off_all_psu_channels
-                turn_off_all_psu_channels(psu_inst, psu_lock=self._monitor._psu_lock)
-                self.logger.log("PSU CH1/CH2/CH3 OFF on window close (Equipment Self Check)", False)
-
-            # Fully stop the listener QThreads, not just pause them — pause()
-            # leaves the thread alive and polling; on a real close (not
-            # in-app navigation) there's no screen left to resume them, so
-            # they should be torn down like stop_all() does.
             self._monitor.stop_all()
-
         event.accept()
+        
+    def set_istj_searching(self, ui_name: str = "Microcontroller"):
+        """
+        Transient state while _SelfTestRefreshThread checks CH3 and
+        resolves the ISTJ COM port (Req #15). Deliberately does NOT touch
+        self.device_status and does NOT go through on_device_disconnected
+        — this is not a connected→disconnected transition, so it must not
+        arm _disconnect_popup_shown or fire the DisconnectToast. The real
+        outcome still arrives via on_device_reconnected/on_device_disconnected
+        exactly as before; this only paints the intermediate state so the
+        card doesn't sit on stale "Connected"/"Not Connected" for the
+        duration of the background scan.
+        """
+        dot = self.findChild(QLabel, f"status_dot_{ui_name}")
+        txt = self.findChild(QLabel, f"status_text_{ui_name}")
+        if dot:
+            dot.setStyleSheet("color: #f9a825; background-color: transparent; border: none;")
+        if txt:
+            txt.setText("Searching for ISTJ Controller...")
+            txt.setStyleSheet("color: #f9a825; background-color: transparent; border: none;")
 
     def on_device_disconnected(self, ui_name: str, message: str):
         self.device_status[ui_name] = False
@@ -1473,8 +1580,9 @@ class EquipmentSelfCheckScreen(QMainWindow):
             return
         self._disconnect_popup_shown.add(ui_name)
 
+        display_name = self._RECONNECT_DISPLAY_NAMES.get(ui_name, ui_name)
         toast = DisconnectToast(
-            f"{ui_name} Disconnected",
+            f"{display_name} Disconnected",
             "Please reconnect the device.",
             parent=self
         )
@@ -2009,12 +2117,33 @@ class _TestResultPopup(QDialog):
         outer.addWidget(card)
 
 
+def _safe_timer_stop(timer):
+    """QTimer.stop()/start() must run on the thread the timer lives in.
+    Calling them directly from SelfTestWorker's QThread produces
+    'Timers cannot be stopped/started from another thread' and silently
+    does nothing — the reconnect timer keeps firing alongside the
+    self-test's own CH3/ISTJ handling. Route through invokeMethod so the
+    call actually lands on the main thread."""
+    if timer is None:
+        return
+    QMetaObject.invokeMethod(timer, "stop", Qt.QueuedConnection)
+
+
+def _safe_timer_start(timer):
+    if timer is None:
+        return
+    QMetaObject.invokeMethod(timer, "start", Qt.QueuedConnection)
+
+
+# after
 class SelfTestWorker(QThread):
     log_signal      = pyqtSignal(str, bool)
     done_signal     = pyqtSignal(bool)
     operator_signal = pyqtSignal(str, str, str)   # title, message, image_path
     operator_yesno_signal = pyqtSignal(str, str, str)
     queue_popup_signal = pyqtSignal(str, str, object, str, object, object)  # title, message, image_path, buttons, extra, callback
+    clear_log_signal = pyqtSignal()   # fired right before the device's own test module starts
+
 
     def __init__(self, device_name, all_devices, connected_devices, skipped_devices, monitor=None):
         super().__init__()
@@ -2030,9 +2159,77 @@ class SelfTestWorker(QThread):
         self.psu_host = SelfTestPSUHost(self)
         self.psu = PSUAutomation(self.psu_host)
         self.osc_conn = None   # OscilloscopeConnection, borrowed from DeviceMonitor in pre-step
+        self._cleanup_done = False   # guards _cleanup_after_test() idempotency
+        # SELF-TEST ABORT SAFETY: name of the device whose test is running
+        # right now, so a confirmed abort can OFF exactly that test's relays.
+        self._current_device_name = None
+
+        # ── Attributes required by STM32RelayController's relay-failure
+        # escalation paths (_prompt_retry_or_abort, _prompt_psu_recovery_or_abort,
+        # _prompt_relay_reset_retry_or_abort) once this worker is registered
+        # as the active screen in run() below. Without these, a relay
+        # failure during a self test either crashes those paths (nothing
+        # to call screen._psu_ready_event on) or, with no screen
+        # registered at all, silently aborts with no popup shown.
+        self._relay_error_active = False
+        self._skip_relay_reset_on_abort = False
+        self._psu_ready_event = Event()
+        self._psu_ready_event.set()   # self tests have no PSU-pause semantics — stay "ready"
+        self._prev_active_screen = None   # saved/restored around run()
+        print("[THREAD] SelfTestWorker CREATED")
+
+    # ------------------------------------------------------------------
+    # Cooperative cancellation
+    # ------------------------------------------------------------------
+    def is_aborted(self) -> bool:
+        return self.abort_event.is_set()
+
+    def check_abort(self):
+        if self.abort_event.is_set():
+            raise TestAbortRequested()
+
+    def abortable_sleep(self, seconds: float):
+        """Sleep in small slices, raising TestAbortRequested the moment
+        an abort is requested instead of blocking the full duration."""
+        end = _time.monotonic() + seconds
+        while True:
+            self.check_abort()
+            remaining = end - _time.monotonic()
+            if remaining <= 0:
+                return
+            _time.sleep(min(0.1, remaining))
 
     # AFTER
     def run(self):
+        print("[THREAD] SelfTestWorker STARTED")
+        # ── Claim STM32RelayController's single global "active screen"
+        # slot for the duration of this self test, so any relay-command
+        # failure routes its retry/abort popup to THIS worker's own dialog
+        # instead of a stale Single/Full Test screen or None.
+        self._prev_active_screen = STM32RelayController._active_screen
+        STM32RelayController.register_screen(self)
+
+        # ── Install the DEDICATED Equipment Self Test APx crash-recovery
+        # hooks (read_apx_meter, read_apx_thd_freq, generator_control) once
+        # for the WHOLE run — covers both a single-device test and "Run
+        # All Self Tests" in one install/remove pair, instead of each
+        # APx-using test module (self_istj.py, self_audio_analyser.py,
+        # self_oscilloscope.py) installing/removing its own copy. Harmless
+        # to install even for a device that never touches APx (PSU, DMM,
+        # Ethernet, RS232/RS422) — the wrapped functions are simply never
+        # called in that case.
+        #
+        # This is intentionally core.equipment_apx_recovery, NOT
+        # core.apx_recovery — a separate, operator-driven "Retry" button
+        # recovery specific to this screen. It does not touch and is not
+        # touched by core.apx_recovery (used by the tuning/Single-Test/
+        # Full-Test workflow) or by the generic relay/STM32 recovery used
+        # in self_dmm.py / self_psu.py.
+        from core.equipment_apx_recovery import (
+            install_equipment_apx_recovery_hooks,
+            remove_equipment_apx_recovery_hooks,
+        )
+        install_equipment_apx_recovery_hooks(self)
         try:
             if self.all_devices:
                 self.log_signal.emit("[INIT]    Initializing full system test sequence...", False)
@@ -2048,15 +2245,16 @@ class SelfTestWorker(QThread):
                             lst.pause()
                         except Exception:
                             pass
-                    try:
-                        _monitor._reconnect_timer.stop()
-                    except Exception:
-                        pass
+                    _safe_timer_stop(_monitor._reconnect_timer)
+                    _monitor._suppress_mcu_ui_signals = True
                     self.log_signal.emit("[SELF-TEST] Device listeners paused for self-test", False)
 
                 try:
                     for name in self.connected_devices:
                         self._run_single(name, manage_listeners=False)
+                        # Guarantees a clean PSU state before the next
+                        # device's own setup runs — see _force_psu_ch1_ch2_off.
+                        self._force_psu_ch1_ch2_off()
                 finally:
                     if _monitor is not None:
                         for lst in getattr(_monitor, '_listeners', []):
@@ -2064,8 +2262,9 @@ class SelfTestWorker(QThread):
                                 lst.resume()
                             except Exception:
                                 pass
+                        _safe_timer_start(_monitor._reconnect_timer)
                         try:
-                            _monitor._reconnect_timer.start()
+                            _monitor.resume_mcu_ui_signals()
                         except Exception:
                             pass
                         self._handback_oscilloscope()
@@ -2083,10 +2282,223 @@ class SelfTestWorker(QThread):
                     )
             else:
                 self._run_single(self.device_name)
+        except TestAbortRequested:
+            print("[THREAD] SelfTestWorker ABORT REQUESTED (caught in run())")
+            self._passed = False
+            self.log_signal.emit("[ABORT] Self test cancelled by operator", False)
         except Exception as e:
             self.log_signal.emit(f"[ERROR]   Unexpected error: {e}", True)
             self._passed = False
+        finally:
+            print("[THREAD] SelfTestWorker CLEANUP START")
+            self._cleanup_after_test()
+            # ── Release the active-screen slot back to whatever it was
+            # before this self test claimed it, so a later Single/Full
+            # Test's relay-failure popups aren't misrouted here.
+            if STM32RelayController._active_screen is self:
+                STM32RelayController._active_screen = self._prev_active_screen
+            remove_equipment_apx_recovery_hooks()
+            print("[THREAD] SelfTestWorker CLEANUP COMPLETE")
+        print("[THREAD] SelfTestWorker RUN RETURNING")
         self.done_signal.emit(self._passed)
+        
+    
+
+    def _force_psu_ch1_ch2_off(self):
+        """
+        Safety net between devices in an "All Devices" run. Each device's
+        own test module already turns CH1/CH2 off at its own clean end —
+        but if that write ever silently doesn't land (e.g. a VISA hiccup
+        during the pre-step that immediately follows), the previous
+        device's voltage can carry straight into the next device's setup.
+        This forces both channels off unconditionally after every device,
+        so the next device always starts from a known, de-energized state.
+        CH3 is deliberately excluded — it's the ISTJ board's own power,
+        managed separately by the pre-step/reconnect-timer logic, same as
+        in _cleanup_after_test's abort-only shutdown above.
+
+        self.psu.psu_inst can be None even though a PSU is physically
+        connected and energized — e.g. this device's own pre-step failed
+        to borrow/open a handle, while the PREVIOUS device (which left
+        CH1/CH2 on) was using a handle borrowed straight from
+        DeviceMonitor's worker. Falls back to that shared handle, and as
+        a last resort to a fresh find_psu() discovery — the same call
+        _pre_step_ch3_and_sync already uses — so this can't silently
+        no-op when a handle genuinely exists somewhere.
+        Best-effort and non-fatal throughout.
+        """
+        try:
+            psu_inst = getattr(self.psu, "psu_inst", None)
+            psu_lock = getattr(self.psu, "psu_lock", None)
+
+            if psu_inst is None:
+                _monitor = self._monitor
+                _worker = getattr(_monitor, "_worker", None) if _monitor is not None else None
+                psu_inst = getattr(_worker, "psu_inst", None) if _worker is not None else None
+                psu_lock = getattr(_monitor, "_psu_lock", None) if _monitor is not None else None
+
+            if psu_inst is None:
+                # Two discovery attempts, back to back, before giving up.
+                # Printed only — this is routine recovery chatter, same as
+                # _prestep_log's own discovery/sync noise, not something
+                # the operator-facing dialog needs to show unless both
+                # attempts genuinely fail.
+                for attempt in (1, 2):
+                    print(f"[SAFETY] No PSU handle found — discovery attempt {attempt}/2...")
+                    try:
+                        psu_inst = self.psu.find_psu()
+                    except Exception as e:
+                        psu_inst = None
+                        print(f"[SAFETY] PSU discovery attempt {attempt}/2 failed: {e}")
+
+                    if psu_inst is not None:
+                        print(f"[SAFETY] PSU found on attempt {attempt}/2 ✓")
+                        self.psu.psu_inst = psu_inst   # so later devices' pre-steps can reuse it
+                        psu_lock = getattr(self.psu, "psu_lock", None)
+                        break
+
+                    if attempt == 1:
+                        _time.sleep(1.0)
+
+            if psu_inst is None:
+                self.log_signal.emit(
+                    "[SAFETY] PSU not reachable after 2 attempts — cannot force "
+                    "CH1/CH2 off before next device. It may not be physically "
+                    "connected.", True
+                )
+                return
+
+            for ch in (1, 2):
+                ok = turn_off_psu_channel(psu_inst, ch, psu_lock=psu_lock)
+                if not ok:
+                    self.log_signal.emit(f"[SAFETY] PSU CH{ch} forced-off failed (non-fatal)", False)
+        except Exception:
+            pass
+
+    def _resume_monitor_listeners(self):
+        """
+        Resumes every paused device listener, restarts DeviceMonitor's
+        reconnect-poll timer, and replays any deferred Microcontroller
+        status transition. Factored out of _cleanup_after_test() so the
+        NORMAL completion path can defer calling this until after the
+        operator has dismissed the PASS/FAIL result popup (see
+        resume_after_result_shown()) — resuming it earlier re-arms
+        listeners and the reconnect timer while the popup's own exec_()
+        nested event loop is the first chance for anything they queue up
+        (a spurious disconnect/reconnect pair right after a CH3
+        power-cycle, in particular) to actually be delivered, which is
+        what produced the disconnect/reconnect toast flicker landing
+        right as the popup appeared. The ABORT path still calls this
+        immediately (no result popup follows an abort to gate on).
+        """
+        _monitor = self._monitor
+        if _monitor is not None:
+            for lst in getattr(_monitor, '_listeners', []):
+                try:
+                    lst.resume()
+                except Exception:
+                    pass
+            _safe_timer_start(_monitor._reconnect_timer)
+            try:
+                _monitor.resume_mcu_ui_signals()    
+            except Exception:
+                pass
+            try:
+                from devices.apx_analyzer import get_apx
+                from devices.device_listeners import AudioAnalyzerListener
+                if (get_apx() is not None and
+                        not any(l.device_type == DeviceType.AUDIO for l in _monitor._listeners)):
+                    _monitor._start(AudioAnalyzerListener())
+                    was_down = "Audio Analyzer" in _monitor._disconnected_devices
+                    _monitor._disconnected_devices.discard("Audio Analyzer")
+                    if _monitor._worker is not None:
+                        _monitor._worker.device_status["Audio Analyzer"] = True
+                    if was_down:
+                        _monitor.device_reconnected.emit("Audio Analyzer")
+            except Exception:
+                pass
+            try:
+                self._handback_oscilloscope()
+            except Exception:
+                pass
+
+    def resume_after_result_shown(self):
+        """
+        Called by SelfTestDialog once the operator has dismissed the
+        PASS/FAIL result popup on a normal (non-aborted) completion.
+        Safe to call even if nothing was deferred — resume()/start() on
+        an already-running listener/timer is a harmless no-op.
+        """
+        self._resume_monitor_listeners()
+
+    def _cleanup_after_test(self):
+        """
+        Idempotent final safety net. Runs on every exit path (normal,
+        aborted, exception). On ABORT, listener/timer/oscilloscope
+        handback happens immediately here, since no result popup follows
+        an aborted run to gate the resume on. On a NORMAL completion,
+        that same resume is deferred — the caller (SelfTestDialog) must
+        call resume_after_result_shown() once the operator dismisses the
+        result popup; see _resume_monitor_listeners() for why. PSU
+        CH1/CH2 forced-off only happens on an ABORTED run — normal
+        completion already leaves each test module's own end-of-test
+        shutdown code to run PSU CH1/CH2 off itself, and we don't want to
+        fight that or turn channels off mid-sequence for a test that's
+        still legitimately using them.
+
+        This exists specifically so self_istj.py, self_dmm.py, etc. never
+        need abort-awareness inserted into their own step sequences —
+        hardware safety on abort is handled once, here, generically,
+        regardless of which device's test was running.
+        """
+        if self._cleanup_done:
+            return
+        self._cleanup_done = True
+
+        if self.abort_event.is_set():
+            self._resume_monitor_listeners()
+
+        try:
+            from devices.apx_analyzer import get_apx
+            apx = get_apx()
+            if apx is not None:
+                apx.BenchMode.Generator.On = False
+                try:
+                    apx.AudibleSignalMonitor.Enabled = False
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # ── Abort-only PSU CH1/CH2 safety shutdown ──────────────────────
+        # Any test module (PSU, DMM, ISTJ) can leave CH1 and/or CH2 on
+        # mid-sequence when it's cut short by an abort. Rather than adding
+        # abort checks inside each module's own step sequence, force both
+        # channels off here — once, generically — whenever this worker
+        # ends because of an abort. CH3 is deliberately excluded: it's the
+        # ISTJ board's own power and is managed by the existing pre-step/
+        # reconnect-timer logic, not by individual test modules.
+        if self.abort_event.is_set():
+            try:
+                psu_inst = getattr(self.psu, "psu_inst", None)
+                psu_lock = getattr(self.psu, "psu_lock", None)
+                if psu_inst is not None:
+                    for ch in (1, 2):
+                        try:
+                            if psu_lock is not None:
+                                with psu_lock:
+                                    psu_inst.write(f"INST:NSEL {ch}")
+                                    _time.sleep(0.1)
+                                    psu_inst.write("OUTP OFF")
+                            else:
+                                psu_inst.write(f"INST:NSEL {ch}")
+                                _time.sleep(0.1)
+                                psu_inst.write("OUTP OFF")
+                            self.log_signal.emit(f"[ABORT] PSU CH{ch} forced OFF (safety shutdown)", False)
+                        except Exception as e:
+                            self.log_signal.emit(f"[ABORT] PSU CH{ch} forced-off failed (non-fatal): {e}", False)
+            except Exception:
+                pass
 
     def _queue_popup(self, title, message, image_path, buttons, extra=None, callback=None):
         """
@@ -2108,10 +2520,45 @@ class SelfTestWorker(QThread):
         "RS422":                    lambda self: self_rs422.run(self),
     }
 
-
+    def _prestep_log(self, message: str, is_error: bool = False):
+        """
+        Pre-step diagnostic line (CH3 power-cycle, PSU/OSC handle borrow,
+        ISTJ sync). In "All Devices" mode this method runs once per
+        connected device, so routing these to the visible dialog would
+        flood the shared log across the whole batch with repeated
+        power-cycle/sync chatter. Printed to the terminal there instead —
+        still visible for debugging, just out of the operator-facing log.
+        Single-device runs still show them in the dialog (briefly, until
+        clear_log_signal wipes it right before the actual test starts).
+        """
+        if self.all_devices:
+            print(f"[PRE-STEP]{' ERROR:' if is_error else ''} {message}")
+        else:
+            self.log_signal.emit(message, is_error)
     
-    def _pre_step_ch3_and_sync(self):
-        print("[PRE-STEP] Powering CH3 OFF then ON, then syncing ISTJ...")
+    # Devices whose own test module (ISTJ pairing, Oscilloscope,
+    # Audio Analyzer) launches/uses apx via configure_apx(). DMM and PSU
+    # never touch apx, so they're excluded — closing apx for them would
+    # be pure wasted time.
+    _APX_USING_DEVICES = {"Oscilloscope", "Microcontroller", "Audio Analyzer"}
+
+    def _pre_step_ch3_and_sync(self, name: str = None):
+        print("[PRE-STEP] Checking CH3 state, then syncing ISTJ...")
+
+        # ── Step -1: Close any stale apx instance before this device's own
+        # test module tries to relaunch it via configure_apx(). Only for
+        # the 3 devices that actually use apx — runs once per device here,
+        # covering both an individual "Run Self Test" click and "Run All
+        # Self Tests", since both paths pass through this pre-step.
+        if name in self._APX_USING_DEVICES:
+            try:
+                if self._monitor is not None:
+                    # remove (not just pause) the poller before APx is exited underneath it
+                    self._monitor._remove_dead_listener(DeviceType.AUDIO)
+                from devices.apx_analyzer import close_apx
+                close_apx()
+            except Exception as e:
+                self._prestep_log(f"[PRE-STEP] apx close skipped (non-fatal): {e}", False)
 
         # ── Step 0: Borrow existing PSU handle from DeviceMonitor (no new connection) ──
         self.psu._psu_error_handled = False
@@ -2137,7 +2584,7 @@ class SelfTestWorker(QThread):
                 # CH1 voltage commands land on CH3.
                 if self._monitor is not None and getattr(self._monitor, "_psu_lock", None) is not None:
                     self.psu.psu_lock = self._monitor._psu_lock
-                self.log_signal.emit("[PRE-STEP] PSU handle borrowed from DeviceMonitor ✓ (lock synced)", False)
+                self._prestep_log("[PRE-STEP] PSU handle borrowed from DeviceMonitor ✓ (lock synced)", False)
                 try:
                     with self.psu.psu_lock:
                         self.psu.psu_inst.write("*CLS")
@@ -2145,30 +2592,24 @@ class SelfTestWorker(QThread):
                         self.psu.psu_inst.write("SYST:REM")
                         _time.sleep(0.2)
                 except Exception as _re:
-                    self.log_signal.emit(f"[PRE-STEP] SYST:REM suppressed (non-fatal): {_re}", False)
+                    self._prestep_log(f"[PRE-STEP] SYST:REM suppressed (non-fatal): {_re}", False)
             else:
                 # Fallback: open fresh handle
-                self.log_signal.emit("[PRE-STEP] No existing PSU handle — opening fresh...", False)
+                self._prestep_log("[PRE-STEP] No existing PSU handle — opening fresh...", False)
                 if self.psu.psu_inst:
                     try:
                         self.psu.psu_inst.close()
                     except Exception:
                         pass
                     self.psu.psu_inst = None
-                if self.psu.rm:
-                    try:
-                        self.psu.rm.close()
-                    except Exception:
-                        pass
-                    finally:
-                        self.psu.rm = None
+                self.psu.rm = None   # never rm.close(): it is process-wide
 
                 import pyvisa as _pyvisa
                 self.psu.rm = _pyvisa.ResourceManager()
                 self.psu.psu_inst = self.psu.find_psu()
 
                 if self.psu.psu_inst:
-                    self.log_signal.emit("[PRE-STEP] PSU handle opened fresh ✓", False)
+                    self._prestep_log("[PRE-STEP] PSU handle opened fresh ✓", False)
                     try:
                         with self.psu.psu_lock:
                             self.psu.psu_inst.write("*CLS")
@@ -2176,67 +2617,126 @@ class SelfTestWorker(QThread):
                             self.psu.psu_inst.write("SYST:REM")
                             _time.sleep(0.2)
                     except Exception as _re:
-                        self.log_signal.emit(f"[PRE-STEP] SYST:REM suppressed (non-fatal): {_re}", False)
+                        self._prestep_log(f"[PRE-STEP] SYST:REM suppressed (non-fatal): {_re}", False)
                 else:
-                    self.log_signal.emit("[PRE-STEP] PSU not found — CH3 power cycle will be skipped", False)
+                    self._prestep_log("[PRE-STEP] PSU not found — CH3 power cycle will be skipped", False)
         except Exception as e:
-            self.log_signal.emit(f"[PRE-STEP] PSU handle open failed (non-fatal): {e}", False)
+            self._prestep_log(f"[PRE-STEP] PSU handle open failed (non-fatal): {e}", False)
 
         # ── Step 0.5: Borrow existing Oscilloscope handle from DeviceMonitor ────
+        # Only (re)borrow if we don't already hold a live handle. Before this
+        # guard, this ran once per device in an "All Devices" pass — every
+        # extra re-borrow re-queries *IDN? on a shared USB bus right before
+        # the next device's own setup commands, which is what was dropping
+        # the scope's comms and corrupting PSU CH1 writes that followed
+        # moments later (see the DMM test reading a stale 27.21V that
+        # actually belonged to the previous ISTJ voltage-relay test).
+        if getattr(self, "osc_conn", None) is not None and self.osc_conn.is_connected():
+            self._prestep_log(
+                "[PRE-STEP] Oscilloscope already connected — skipping re-borrow",
+                False,
+            )
+        else:
+            try:
+                _existing_osc = None
+                if self._monitor is not None:
+                    _worker = getattr(self._monitor, '_worker', None)
+                    if _worker is not None:
+                        _existing_osc = getattr(_worker, 'oscilloscope_connection', None)
+
+                if _existing_osc is not None:
+                    # Stop DeviceMonitor's OscilloscopeListener so it can't race
+                    # the test thread for write()/query() on the same VISA session.
+                    self._monitor._remove_dead_listener(DeviceType.OSC)
+                    self._monitor._disconnected_devices.discard("Oscilloscope")
+
+                    conn = OscilloscopeConnection()
+                    conn.instrument = _existing_osc
+                    conn.resource_string = getattr(_existing_osc, "resource_name", None)
+                    try:
+                        idn = _existing_osc.query("*IDN?").strip()
+                        conn.identification = conn._parse_idn_response(idn)
+                    except Exception:
+                        conn.identification = None
+
+                    self.osc_conn = conn
+                    self._prestep_log(
+                        "[PRE-STEP] Oscilloscope handle borrowed from DeviceMonitor ✓ (listener paused)",
+                        False,
+                    )
+                else:
+                    self._prestep_log(
+                        "[PRE-STEP] No existing Oscilloscope handle — will connect on first use",
+                        False,
+                    )
+            except Exception as e:
+                self._prestep_log(f"[PRE-STEP] Oscilloscope handle borrow failed (non-fatal): {e}", False)
+
+        # after
+        # ── Step 0.9: Invalidate STM32RelayController's cached connection
+        # BEFORE de-powering the board. CH3 power-cycles the ISTJ board's
+        # USB-serial chip, which re-enumerates it — any handle
+        # STM32RelayController is holding becomes stale/dead the instant
+        # CH3 goes OFF. If we leave it cached, the FIRST real relay command
+        # after this pre-step (e.g. set_s23_remote) will try to reuse that
+        # dead handle in _send_on_open_conn() and fail with
+        # "WriteFile failed (PermissionError...)" — exactly what happened
+        # here. Clearing it forces send_and_validate() to take its slow
+        # path and open a genuinely fresh connection on next use.
+        # NEW: kill the listener + release the port BEFORE CH3 is touched at all
+        if self._monitor is not None:
+            self._monitor._remove_dead_listener(DeviceType.MCU)
+            self._prestep_log("[PRE-STEP] Existing ISTJ listener released ✓", False)
+        # ── CH3 STATE-AWARE: only power-cycle CH3 if it is genuinely OFF ──────────
+        # If CH3 is already ON, leave it ON (no OFF -> wait -> ON churn) and go
+        # straight to the ISTJ COM/sync steps below. A failed query is treated
+        # as "unknown" -> falls back to the original power-cycle path.
+        ch3_already_on = False
         try:
-            _existing_osc = None
-            if self._monitor is not None:
-                _worker = getattr(self._monitor, '_worker', None)
-                if _worker is not None:
-                    _existing_osc = getattr(_worker, 'oscilloscope_connection', None)
+            _p = getattr(self.psu, "psu_inst", None)
+            if _p is not None:
+                _lk = getattr(self.psu, "psu_lock", None)
+                if _lk is not None:
+                    with _lk:
+                        _st = _p.query("OUTP? CH3").strip().upper()
+                else:
+                    _st = _p.query("OUTP? CH3").strip().upper()
+                ch3_already_on = _st in ("1", "ON")
+        except Exception as _e:
+            self._prestep_log(f"[PRE-STEP] CH3 state query failed (non-fatal): {_e}", False)
 
-            if _existing_osc is not None:
-                # Stop DeviceMonitor's OscilloscopeListener so it can't race
-                # the test thread for write()/query() on the same VISA session.
-                self._monitor._remove_dead_listener(DeviceType.OSC)
-                self._monitor._disconnected_devices.discard("Oscilloscope")
+        if ch3_already_on:
+            self._prestep_log("[PRE-STEP] CH3 already ON — leaving it ON (no power cycle)", False)
+        else:
+            # ── Step 1: Turn CH3 OFF first (power cycle the board) ──────────────────
+            try:
+                self.psu.psu_send_command("*CLS")
+                self.psu.psu_send_command("OUTP CH3,OFF")
+                # ── We just commanded CH3 OFF ourselves — mark the MCU
+                # disconnected right now instead of waiting for
+                # STM32Listener's next poll to notice. The old listener is
+                # still alive here (it's only removed in Step 2.5 below) and
+                # would eventually catch this on its own, but there's no
+                # reason to leave the card reading "Connected" in the
+                # meantime when we already know the board just lost power.
+                if self._monitor is not None:
+                    self._monitor._set_mcu_status(
+                        self._monitor._worker, False, "CH3 powered OFF for board power-cycle"
+                    )
+                self.abortable_sleep(1.5)   # let board fully de-power
+                self._prestep_log("[PRE-STEP] CH3 turned OFF (board de-powered)", False)
+            except Exception as e:
+                self._prestep_log(f"[PRE-STEP] CH3 OFF failed (non-fatal): {e}", False)
 
-                conn = OscilloscopeConnection()
-                conn.instrument = _existing_osc
-                conn.resource_string = getattr(_existing_osc, "resource_name", None)
-                try:
-                    idn = _existing_osc.query("*IDN?").strip()
-                    conn.identification = conn._parse_idn_response(idn)
-                except Exception:
-                    conn.identification = None
-
-                self.osc_conn = conn
-                self.log_signal.emit(
-                    "[PRE-STEP] Oscilloscope handle borrowed from DeviceMonitor ✓ (listener paused)",
-                    False,
-                )
-            else:
-                self.log_signal.emit(
-                    "[PRE-STEP] No existing Oscilloscope handle — will connect on first use",
-                    False,
-                )
-        except Exception as e:
-            self.log_signal.emit(f"[PRE-STEP] Oscilloscope handle borrow failed (non-fatal): {e}", False)
-
-        # ── Step 1: Turn CH3 OFF first (power cycle the board) ──────────────────
-        try:
-            self.psu.psu_send_command("*CLS")
-            self.psu.psu_send_command("INST:NSEL 3")
-            _time.sleep(0.1)
-            self.psu.psu_send_command("OUTP OFF")
-            _time.sleep(1.5)   # let board fully de-power
-            self.log_signal.emit("[PRE-STEP] CH3 turned OFF (board de-powered)", False)
-        except Exception as e:
-            self.log_signal.emit(f"[PRE-STEP] CH3 OFF failed (non-fatal): {e}", False)
-
-        # ── Step 2: Turn CH3 ON (power board back up) ───────────────────────────
-        try:
-            _time.sleep(0.5)
-            self.psu.worker_ch3_5v()
-            self.log_signal.emit("[PRE-STEP] CH3 turned ON (5V/1A) — waiting for board to boot...", False)
-            _time.sleep(8.0)   # ← increased: board needs time to power up and enumerate USB
-        except Exception as e:
-            self.log_signal.emit(f"[PRE-STEP] CH3 power-on failed (non-fatal): {e}", False)
+            # ── Step 2: Turn CH3 ON (power board back up) ───────────────────────────
+            try:
+                _time.sleep(0.5)
+                self.psu.worker_ch3_5v()
+                self._prestep_log("[PRE-STEP] CH3 turned ON (5V/1A) — waiting for board to boot...", False)
+                # CH3 STATE-AWARE: poll for COM instead of a blind 8s wait (same 8s upper bound).
+                self._wait_for_istj_com(8.0)
+            except Exception as e:
+                self._prestep_log(f"[PRE-STEP] CH3 power-on failed (non-fatal): {e}", False)
 
         # ── Step 2.5: Release any existing Microcontroller listener's serial
         # handle before we try to open the port ourselves. pause() alone
@@ -2245,9 +2745,9 @@ class SelfTestWorker(QThread):
         try:
             if self._monitor is not None:
                 self._monitor._remove_dead_listener(DeviceType.MCU)
-                self.log_signal.emit("[PRE-STEP] Existing ISTJ listener released ✓", False)
+                self._prestep_log("[PRE-STEP] Existing ISTJ listener released ✓", False)
         except Exception as e:
-            self.log_signal.emit(f"[PRE-STEP] ISTJ listener release failed (non-fatal): {e}", False)
+            self._prestep_log(f"[PRE-STEP] ISTJ listener release failed (non-fatal): {e}", False)
 
         # ── Step 3: Identify available COM ports ────────────────────────────────
         stm32_ports = []   # ← declare BEFORE the try so Step 3.5 always sees it
@@ -2265,16 +2765,16 @@ class SelfTestWorker(QThread):
                     stm32_ports.append(p.device)
 
             if stm32_ports:
-                self.log_signal.emit(f"[PRE-STEP] ISTJ COM port(s) found: {', '.join(stm32_ports)}", False)
+                self._prestep_log(f"[PRE-STEP] ISTJ COM port(s) found: {', '.join(stm32_ports)}", False)
             else:
-                self.log_signal.emit("[PRE-STEP] No ISTJ COM port found — sync may fail", False)
+                self._prestep_log("[PRE-STEP] No ISTJ COM port found — sync may fail", False)
         except Exception as e:
-            self.log_signal.emit(f"[PRE-STEP] COM port scan failed: {e}", False)
+            self._prestep_log(f"[PRE-STEP] COM port scan failed: {e}", False)
 
         # ── Step 3.5: Extra wait if no COM port found yet ────────────────────────
         if not stm32_ports:
-            self.log_signal.emit("[PRE-STEP] No COM port found — waiting 3s more for USB enumeration...", False)
-            _time.sleep(3.0)
+            self._prestep_log("[PRE-STEP] No COM port found — waiting 3s more for USB enumeration...", False)
+            self.abortable_sleep(3.0)
             # Re-scan once more
             try:
                 import serial.tools.list_ports as _lp
@@ -2285,40 +2785,63 @@ class SelfTestWorker(QThread):
                     if not any(k in (p.description or "") for k in ["Bluetooth", "Wireless", "Intel", "Modem"])
                 ]
                 if stm32_ports:
-                    self.log_signal.emit(f"[PRE-STEP] ISTJ COM port(s) found after wait: {', '.join(stm32_ports)}", False)
+                    self._prestep_log(f"[PRE-STEP] ISTJ COM port(s) found after wait: {', '.join(stm32_ports)}", False)
                 else:
-                    self.log_signal.emit("[PRE-STEP] Still no ISTJ COM port — sync will likely fail", False)
+                    self._prestep_log("[PRE-STEP] Still no ISTJ COM port — sync will likely fail", False)
             except Exception:
                 pass
 
-        # ── Step 4: Sync ISTJ directly on confirmed COM port ────────────────────
+# after
         try:
             if stm32_ports:
-                com_port = stm32_ports[0]
-                self.log_signal.emit(f"[PRE-STEP] Using COM port: {com_port}", False)
-                import serial as _serial
-                tx = bytearray([0x02, 0x35, 0x02, 0xFF, 0x00, 0x98, 0x03, 0x0D])
-                try:
-                    ser = _serial.Serial(com_port, 115200, timeout=2)
-                    ser.reset_input_buffer()
-                    ser.write(tx)
-                    _time.sleep(0.4)
-                    rx = ser.read(8)
-                    ser.close()
-                    if (len(rx) == 8 and rx[0] == 0x02 and rx[1] == 0x35 and
-                            rx[3] == 0xFF and rx[4] == 0x01 and
-                            rx[6] == 0x03 and rx[7] == 0x0D):
-                        self.log_signal.emit("[PRE-STEP] ISTJ sync confirmed ✓", False)
+                self._prestep_log(f"[PRE-STEP] Using COM port: {stm32_ports[0]}", False)
+                # Go through STM32RelayController.sync() itself rather than a
+                # raw open/write/close — sync() already (a) detects and
+                # clears a stale _default_state_conn if the write fails,
+                # (b) reuses the live handle if one is already valid, and
+                # (c) registers a fresh connection as _default_state_conn /
+                # _cached_port on success. Doing our own raw open+close here
+                # bypassed all of that bookkeeping, which is what caused
+                # both the earlier "WriteFile...PermissionError" (stale
+                # handle reused) and the later "Access is denied" (listener
+                # and relay controller each opening their own handle).
+                sync_ok = STM32RelayController.send_with_retry(STM32RelayController.sync)
+                if sync_ok:
+                    self._prestep_log("[PRE-STEP] ISTJ sync confirmed ✓", False)
+                    if self._monitor is not None:
+                        if self._monitor._restart_mcu_listener():
+                            self._prestep_log("[PRE-STEP] STM32Listener restarted ✓ (ISTJ monitoring resumed)", False)
+                        else:
+                            self._prestep_log("[PRE-STEP] STM32Listener restart failed (non-fatal) — ISTJ may show Disconnected", True)
+                    # Relay restore intentionally removed — a self test
+                    # should always start from the board's own power-on
+                    # default state, not whatever was left active before.
+                else:
+                    if ch3_already_on:
+                        # CH3 was already ON and the ISTJ COM port is present, so the
+                        # board is already up and in sync — this is not an error.
+                        self._prestep_log(
+                            "[PRE-STEP] Board already in sync — ISTJ COM port detected ✓", False)
                     else:
-                        self.log_signal.emit(f"[PRE-STEP] Sync response invalid: {rx.hex() if rx else 'empty'}", False)
-                except Exception as se:
-                    self.log_signal.emit(f"[PRE-STEP] Serial open failed on {com_port}: {se}", False)
+                        # We just power-cycled CH3, so a failed sync here is a real concern.
+                        self._prestep_log(
+                            "[PRE-STEP] ISTJ sync failed — board may not have booted yet", True)
             else:
-                self.log_signal.emit("[PRE-STEP] No COM port found — cannot sync ISTJ", False)
+                self._prestep_log("[PRE-STEP] No COM port found — cannot sync ISTJ", False)
             _time.sleep(2)
         except Exception as e:
-            self.log_signal.emit(f"[PRE-STEP] ISTJ sync raised an exception: {e}", False)
+            self._prestep_log(f"[PRE-STEP] ISTJ sync raised an exception: {e}", False)
             _time.sleep(2)
+
+        # ── Step 4: Force CH1/CH2 OFF after ISTJ sync completes ──────────────────
+        try:
+            self.psu.psu_send_command("*CLS")
+            self.psu.psu_send_command("OUTP CH1,OFF")
+            self.psu.psu_send_command("OUTP CH2,OFF")
+
+            self._prestep_log("[PRE-STEP] CH1/CH2 forced OFF after ISTJ sync", False)
+        except Exception as e:
+            self._prestep_log(f"[PRE-STEP] CH1/CH2 forced-off after sync failed (non-fatal): {e}", False)
 
     def _handback_oscilloscope(self):
         """
@@ -2349,13 +2872,44 @@ class SelfTestWorker(QThread):
             self.log_signal.emit(f"[HANDBACK] Oscilloscope handback failed (non-fatal): {e}", False)
         finally:
             self.osc_conn = None
+            
+    @staticmethod
+    def _istj_com_ports():
+        """Same ISTJ COM filter used by Step 3 of the pre-step."""
+        import serial.tools.list_ports
+        out = []
+        for p in serial.tools.list_ports.comports():
+            desc = p.description or ""
+            if any(k in desc for k in ["Bluetooth", "Wireless", "Intel", "Modem"]):
+                continue
+            if p.vid == 0x0483 or "ISTJ" in desc or "ST-Link" in desc or "USB Serial" in desc:
+                out.append(p.device)
+        return out
+
+    def _wait_for_istj_com(self, max_s: float, settle_s: float = 1.5):
+        """CH3 STATE-AWARE: poll for the ISTJ COM port instead of a blind fixed
+        wait. Returns as soon as the port appears (plus a short settle so the
+        board's USB-serial is usable), or after max_s. Abortable."""
+        waited = 0.0
+        while waited < max_s:
+            try:
+                if self._istj_com_ports():
+                    self.abortable_sleep(settle_s)
+                    return True
+            except Exception:
+                pass
+            self.abortable_sleep(0.25)
+            waited += 0.25
+        return False
     
 
-    _PRE_STEP_DEVICES      = {"Oscilloscope", "Microcontroller", "DMM (Digital Multimeter)", "Audio Analyzer","PSU (Power Supply)", "DMM (Digital Multimeter)"}
+    _PRE_STEP_DEVICES      = {"Oscilloscope", "Microcontroller", "DMM (Digital Multimeter)", "Audio Analyzer","PSU (Power Supply)"}
     
     
     def _run_single(self, name: str, manage_listeners: bool = True):
         _monitor = self._monitor
+        self._current_device_name = name   # SELF-TEST ABORT SAFETY (tracking only)
+        self.check_abort()
         # ── Guard against a stale set() from a previous popup/device in this
         # run — without this, the very next operator popup's .wait() call can
         # return instantly, letting the test proceed before the operator has
@@ -2368,10 +2922,13 @@ class SelfTestWorker(QThread):
                     lst.pause()
                 except Exception:
                     pass
-            try:
-                _monitor._reconnect_timer.stop()
-            except Exception:
-                pass
+            # Set suppression BEFORE requesting the timer stop — the flag
+            # write is synchronous and visible to the main thread
+            # immediately, unlike QMetaObject.invokeMethod's QueuedConnection,
+            # which only guarantees the stop will eventually be processed,
+            # not that it already has been by the time this thread proceeds.
+            _monitor._suppress_mcu_ui_signals = True
+            _safe_timer_stop(_monitor._reconnect_timer)
             self.log_signal.emit("[SELF-TEST] Device listeners paused for self-test", False)
 
         try:
@@ -2379,14 +2936,30 @@ class SelfTestWorker(QThread):
             # CH3 5V + ISTJ sync — devices that talk to the board.
             # Runs in full for every pre-step device, every time — unchanged.
             if name in self._PRE_STEP_DEVICES:
-                self._pre_step_ch3_and_sync()
-                _time.sleep(2)
+                self._pre_step_ch3_and_sync(name)
+                self.check_abort()
+                self.abortable_sleep(2)
 
+# after
+# after
+            self.check_abort()
             fn = self._SELF_TEST_MAP.get(name)
             if fn:
+                # ── Only clear for a single-device run. In "All Devices"
+                # mode this method runs once per connected device — clearing
+                # here would wipe every earlier device's result out of the
+                # visible log each time the next one starts. Pre-step noise
+                # is kept out of the visible log a different way in that
+                # mode (see _prestep_log below), so nothing needs wiping.
+                if not self.all_devices:
+                    self.clear_log_signal.emit()
                 fn(self)
             else:
                 self.log_signal.emit(f"[SKIP]    No self-test defined for {name}.", False)
+        except TestAbortRequested:
+            self.log_signal.emit(f"[ABORT]   {name} self-test cancelled by operator", False)
+            self._passed = False
+            raise   # propagate so run()'s outer handler logs the overall abort once
         except Exception as e:
             self.log_signal.emit(f"[ERROR]   {name} self-test raised: {e}", True)
             self._passed = False
@@ -2397,8 +2970,9 @@ class SelfTestWorker(QThread):
                         lst.resume()
                     except Exception:
                         pass
+                _safe_timer_start(_monitor._reconnect_timer)
                 try:
-                    _monitor._reconnect_timer.start()
+                    _monitor.resume_mcu_ui_signals()
                 except Exception:
                     pass
                 self._handback_oscilloscope()
@@ -2795,6 +3369,8 @@ class SerialTerminalDialog(QDialog):
         cursor.insertText(line + "\n", fmt)
         self.log_box.setTextCursor(cursor)
         self.log_box.ensureCursorVisible()
+        
+    
 
     def _save_pdf(self):
         from core.paths import LOGS_PDF_DIR
@@ -2832,6 +3408,38 @@ class SerialTerminalDialog(QDialog):
         event.accept()
         self.done(QDialog.Accepted)
                     
+import re as _re_mod
+_REAL_FAIL_RE = _re_mod.compile(r'\bFAIL(?:ED|URE)?\b|✗|❌')
+_NOISE_TAGS = ("[PRE-STEP]", "[HANDBACK]", "[SELF-TEST]", "[SAFETY]")
+
+
+def _scan_verdict(lines):
+    """Return (has_fail, has_pass), judged only from the first
+    '...COMMENCING <device> SELF TEST...' line onward. Everything before it
+    (SELF-TEST/PRE-STEP chatter, [INIT], [SKIP]) is ignored.
+    Returns (False, False) if no COMMENCING line was ever logged, so the
+    caller falls back to the worker's own verdict."""
+    start = None
+    for i, ln in enumerate(lines):
+        up = ln.upper()
+        if "COMMENCING" in up and "SELF TEST" in up:
+            start = i
+            break
+    if start is None:
+        return False, False
+
+    has_fail = has_pass = False
+    for ln in lines[start:]:
+        if any(t in ln for t in _NOISE_TAGS):
+            continue                      # housekeeping lines never decide the verdict
+        up = ln.upper()
+        if _REAL_FAIL_RE.search(up):
+            has_fail = True
+        if "PASS" in up or "✅" in up or "✓" in up:
+            has_pass = True
+    return has_fail, has_pass
+
+
 class SelfTestDialog(QDialog):
     """
     Popup for running self-test on one or all devices.
@@ -2873,8 +3481,7 @@ class SelfTestDialog(QDialog):
         self.resize(responsive_size(0.65, 0.8, min_w=820, min_h=560, max_w=1500, max_h=1000))
         self.setWindowModality(Qt.NonModal)
         self.setWindowFlags(
-            Qt.Window | Qt.WindowCloseButtonHint |
-            Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint
+            Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMaximizeButtonHint
         )
         self.setStyleSheet("""
             QDialog { background-color: #ffffff; }
@@ -2923,6 +3530,7 @@ class SelfTestDialog(QDialog):
         self.save_btn.clicked.connect(self._save_pdf)
         btn_row.addWidget(self.save_btn)
 
+
         # In SelfTestDialog.__init__, replace the close_btn block:
         self.close_btn = QPushButton("Abort Test")
         self.close_btn.setMinimumWidth(100)
@@ -2941,26 +3549,67 @@ class SelfTestDialog(QDialog):
 
         layout.addLayout(btn_row)
 
+        # ── Abort/lifecycle state ──────────────────────────────────────────
+        self._abort_requested = False      # user clicked Abort/Close and confirmed
+        self._abort_confirmed_pending_close = False
+        self._abort_cleanup_done = False   # guards _run_abort_relay_cleanup() idempotency
+        self._stopping_poll_timer = None
+        self._active_operator_popups = []   # NEW — tracked so closeEvent can hide/restore them
+
         # ── Launch worker thread ──────────────────────────────────────────
         _monitor = getattr(parent, '_monitor', None) if parent else None
         self._worker = SelfTestWorker(
             device_name, all_devices, connected_devices, skipped_devices,
             monitor=_monitor
         )
+# after
         self._worker.log_signal.connect(self._on_log)
         self._worker.done_signal.connect(self._on_done)
         self._worker.operator_signal.connect(self._show_operator_prompt)
         self._worker.operator_yesno_signal.connect(self._show_operator_yesno_prompt)
         self._worker.queue_popup_signal.connect(self._show_queued_popup)
+        self._worker.clear_log_signal.connect(self._on_clear_log)
+        # Qt's own thread-lifecycle signal — the ONLY thing allowed to
+        # tell us the QThread object is safe to stop tracking / let the
+        # dialog actually close.
+        self._worker.finished.connect(self._on_worker_qthread_finished)
         self._worker.start()
 
     @pyqtSlot(str, bool)
     def _on_log(self, message: str, is_error: bool):
+        # Once abort has been requested, the operator only needs the single
+        # confirmation line already appended by _begin_cooperative_abort —
+        # everything the worker/test-module emits while it winds down
+        # (shutdown-tail relay/PSU chatter, listener resume, cleanup
+        # housekeeping) is diagnostic noise for the log panel. Send it to
+        # the terminal instead so it's still there for debugging.
+        if self._abort_requested:
+            print(f"[LOG] {message}")
+            return
         self._append(message, is_error)
 
+    @pyqtSlot()
+    def _on_clear_log(self):
+        """
+        Wipes the visible log panel right as the device's own test module
+        begins. self.log_lines is untouched, so Save Log as PDF and the
+        final .log file still contain the full run, pre-step included.
+        """
+        self.log_box.clear()
 
     @pyqtSlot(bool)
     def _on_done(self, passed: bool):
+        # An aborted run still emits done_signal (TestAbortRequested is
+        # caught inside SelfTestWorker.run(), not propagated), so this slot
+        # fires even when the operator cancelled. In that case the abort
+        # outcome — "ABORTED", no report finalized, no result popup — is
+        # owned entirely by _on_worker_qthread_finished (driven by Qt's
+        # `finished` signal). Saving a PASS/FAIL report and popping the
+        # result dialog here would be wrong: the test never ran to
+        # completion, so there's nothing legitimate to finalize.
+        if self._abort_requested:
+            return
+
         self.test_completed = True
         self.save_btn.setEnabled(True)
         self.close_btn.setEnabled(True)
@@ -2971,9 +3620,7 @@ class SelfTestDialog(QDialog):
         # Individual test modules emit "[FAIL]" lines but may not propagate the
         # failure back through the worker's _passed flag. Scanning log_lines is
         # the authoritative source of truth.
-        _log_upper = " ".join(self.log_lines).upper()
-        has_fail   = "FAIL" in _log_upper
-        has_pass   = "PASS" in _log_upper
+        has_fail, has_pass = _scan_verdict(self.log_lines)
 
         if has_fail:
             passed = False          # at least one sub-test failed → whole report is FAIL
@@ -3023,6 +3670,17 @@ class SelfTestDialog(QDialog):
         except Exception as _ce:
             print(f"[SELF-TEST] Result popup failed (non-fatal): {_ce}")
 
+        # ── Only now — after the operator has dismissed the result popup —
+        # resume device listeners and the reconnect timer. Doing this
+        # earlier (inside the worker's own cleanup, before done_signal was
+        # even emitted) is what let a spurious MCU disconnect/reconnect
+        # pair sit queued and then flush the instant the popup's exec_()
+        # opened its nested event loop, producing the toast flicker.
+        try:
+            self._worker.resume_after_result_shown()
+        except Exception as _re:
+            print(f"[SELF-TEST] Listener resume after result popup failed (non-fatal): {_re}")
+
     @pyqtSlot(str, str, str)
     def _show_operator_prompt(self, title: str, message: str, image_path: str):
         # ── Ensure this popup starts from a clean, unset state — closes the
@@ -3037,7 +3695,12 @@ class SelfTestDialog(QDialog):
             buttons="ok",
             parent=self
         )
-        popup.finished.connect(lambda _: self._worker._operator_event.set())
+        self._active_operator_popups.append(popup)   # NEW
+        def _cleanup(_):
+            self._worker._operator_event.set()
+            if popup in self._active_operator_popups:   # NEW
+                self._active_operator_popups.remove(popup)
+        popup.finished.connect(_cleanup)
         popup.setWindowModality(Qt.NonModal)
         popup.setWindowFlags(popup.windowFlags() | Qt.WindowStaysOnTopHint)
         popup.show()
@@ -3051,10 +3714,13 @@ class SelfTestDialog(QDialog):
             buttons="yes_no",
             parent=self
         )
+        self._active_operator_popups.append(popup)   # NEW
 
         def _on_finished(_result_code):
             self._worker.last_operator_response = popup.operator_response  # "YES" or "NO"
             self._worker._operator_event.set()
+            if popup in self._active_operator_popups:   # NEW
+                self._active_operator_popups.remove(popup)
 
         popup.finished.connect(_on_finished)
         popup.setWindowModality(Qt.NonModal)
@@ -3070,6 +3736,11 @@ class SelfTestDialog(QDialog):
             buttons=buttons,
             parent=self
         )
+        self._active_operator_popups.append(popup)   # NEW
+        def _remove(_result):
+            if popup in self._active_operator_popups:
+                self._active_operator_popups.remove(popup)
+        popup.finished.connect(_remove)   # NEW
         if callback:
             popup.finished.connect(lambda result: callback(result, popup))
         popup.setWindowModality(Qt.NonModal)
@@ -3165,6 +3836,40 @@ class SelfTestDialog(QDialog):
         self.log_box.setTextCursor(cursor)
         self.log_box.ensureCursorVisible()
 
+    def _update_stopping_line(self, text: str):
+        """
+        Rewrite a single 'Stopping...' line in place, with a fresh
+        timestamp, instead of appending a new line every tick. Only used
+        by the cooperative-abort poll timer. Not written to the on-disk
+        log file (it's a transient UI status, not a distinct event) —
+        the final "Worker stopped safely" outcome is still recorded via
+        the normal print/log paths once abort actually completes.
+        """
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}]  {text}"
+
+        doc = self.log_box.document()
+        cursor = self.log_box.textCursor()
+
+        if self._stopping_line_block is None:
+            cursor.movePosition(cursor.End)
+            if not doc.isEmpty():
+                cursor.insertBlock()
+            self._stopping_line_block = cursor.blockNumber()
+        else:
+            block = doc.findBlockByNumber(self._stopping_line_block)
+            cursor.setPosition(block.position())
+            cursor.movePosition(cursor.EndOfBlock, cursor.KeepAnchor)
+            cursor.removeSelectedText()
+
+        fmt = cursor.charFormat()
+        fmt.setForeground(QColor("#fbc02d"))
+        cursor.setCharFormat(fmt)
+        cursor.insertText(line)
+
+        self.log_box.setTextCursor(cursor)
+        self.log_box.ensureCursorVisible()
+
     def _save_pdf(self):
         """
         Convert the finalized .log/.txt log file (already written by
@@ -3183,8 +3888,7 @@ class SelfTestDialog(QDialog):
 
         _report_device = "All_Devices" if self.all_devices else _report_name(self.device_name)
         safe_name = _report_device.replace(" ", "_").replace("(", "").replace(")", "")
-        all_text  = " ".join(lines_to_render).upper()
-        result    = "FAIL" if "FAIL" in all_text else "PASS"
+        result    = "FAIL" if _scan_verdict(lines_to_render)[0] else "PASS"
         date_part = datetime.now().strftime("%d%m%Y")
         time_part = datetime.now().strftime("%H%M")
         pdf_path  = LOGS_PDF_DIR / f"SELF_TEST_{safe_name}_{result}_{date_part}_{time_part}_LOG.pdf"
@@ -3265,57 +3969,214 @@ class SelfTestDialog(QDialog):
         _LogSavedPopup(pdf_path.name, parent=self).exec_()
 
     def closeEvent(self, event):
-        if not self.test_completed:
-            reply = QMessageBox.question(
-                self, "Abort Self Test",
-                "The self test is still running.\n\n"
-                "Aborting will stop it immediately, turn OFF all PSU channels, "
-                "and switch CH3 back ON.\n\n"
-                "Are you sure you want to abort?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-            )
-            if reply != QMessageBox.Yes:
-                event.ignore()
-                return
-            self._abort_test()
+        # Once the worker QThread has genuinely finished (test_completed True
+        # via _on_done, or via _on_worker_qthread_finished after an abort),
+        # closing is always safe — allow it through.
+        if self.test_completed:
             event.accept()
-            self.done(QDialog.Rejected)   # aborted — don't record a "last test" timestamp
+            self.done(QDialog.Accepted if self.test_result != "ABORTED" else QDialog.Rejected)
             return
 
-        event.accept()
-        self.done(QDialog.Accepted)       # normal completion — emits finished(), triggers DB/UI update in parent
+        # Still running: never close/destroy the dialog (and never let the
+        # QThread reference be dropped) while isRunning() is True.
+        event.ignore()
 
-    def _abort_test(self):
-        self._append("[ABORT] Operator requested test abort — stopping...", True)
+        if self._abort_requested:
+            # Abort already in progress — user clicked Close/X again while
+            # "Stopping..." — just remind them, don't stack up confirmations.
+            return
+
+        # NEW — hide any operator popup currently on screen instead of
+        # letting it stack with the abort confirmation.
+        hidden_popups = [p for p in self._active_operator_popups if p.isVisible()]
+        for p in hidden_popups:
+            p.hide()
+
+        confirm_box = QMessageBox(self)
+        confirm_box.setWindowTitle("Abort Self Test")
+        confirm_box.setIcon(QMessageBox.Question)
+        confirm_box.setText(
+            "The self test is still running.\n\n"
+            "Aborting will request the running step to stop at its next "
+            "safe checkpoint. Hardware will be left in a safe state "
+            "automatically once it stops.\n\n"
+            "Are you sure you want to abort?"
+        )
+        confirm_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        confirm_box.setDefaultButton(QMessageBox.No)
+        confirm_box.setWindowFlags(confirm_box.windowFlags() | Qt.WindowStaysOnTopHint)
+        confirm_box.raise_()
+        confirm_box.activateWindow()
+        reply = confirm_box.exec_()
+
+        if reply != QMessageBox.Yes:
+            # NEW — abort cancelled: restore whatever popup was showing.
+            for p in hidden_popups:
+                try:
+                    p.show()
+                    p.raise_()
+                    p.activateWindow()
+                except RuntimeError:
+                    pass
+            return
+
+        # NEW — abort confirmed: the popup's wait is about to be
+        # force-released below, so close it instead of leaving it
+        # hidden and orphaned.
+        for p in hidden_popups:
+            try:
+                p.close()
+            except RuntimeError:
+                pass
+
+        self._begin_cooperative_abort()
+
+    def _begin_cooperative_abort(self):
+        """
+        Requests cancellation and puts the dialog into a non-closable
+        'Stopping...' state. Ownership of the QThread object is NEVER
+        released here — only _on_worker_qthread_finished (driven by Qt's
+        own `finished` signal) may transition us out of this state.
+        """
+        if self._abort_requested:
+            return
+        self._abort_requested = True
+
+        self._append("[ABORT] Operator requested test abort.", True)
+        print("[THREAD] SelfTestWorker ABORT REQUESTED (dialog)")
 
         try:
             self._worker.abort_event.set()
-            self._worker._operator_event.set()
+            self._worker._operator_event.set()   # release any operator-popup wait immediately
             self._worker.last_operator_response = "NO"
         except Exception:
             pass
 
-        # AFTER
-        if self._worker.isRunning():
-            self._worker.terminate()
-            self._worker.wait(3000)
+        self.close_btn.setEnabled(False)
+        self.close_btn.setText("Stopping...")
+        self.close_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #757575; color: white;
+                border-radius: 4px; padding: 8px 14px; border: none;
+            }
+        """)
+
+        # Keep the dialog itself on top and focused once abort is
+        # confirmed — an operator popup released by _operator_event.set()
+        # below may still be visually on screen for a moment, and the
+        # dialog showing "Stopping..." should not get buried under it.
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        self.show()   # re-applying window flags requires re-showing the widget
+        self.raise_()
+        self.activateWindow()
+
+        # Non-blocking diagnostic poll — GUI stays responsive. This is a
+        # visibility aid only; actual completion is driven by the
+        # `finished` signal connected in __init__, never by this timer.
+        # Rewrites a single line in place each tick instead of appending a
+        # new one, so the log panel shows one live "Still waiting..." line
+        # with a running elapsed-time count rather than a growing list.
+        self._stopping_poll_timer = QTimer(self)
+        self._stopping_poll_timer.setInterval(2000)
+        self._elapsed_stopping = 0
+        self._stopping_line_block = None   # QTextBlock this line lives in, once created
+        def _poll():
+            self._elapsed_stopping += 2
+            if self._worker.isRunning():
+                self._update_stopping_line(
+                    f"[ABORT] Still waiting for worker to stop safely... ({self._elapsed_stopping}s)"
+                )
+            else:
+                self._stopping_poll_timer.stop()
+        self._stopping_poll_timer.timeout.connect(_poll)
+        self._stopping_poll_timer.start()
+        
+    
+
+    @pyqtSlot()
+    def _on_worker_qthread_finished(self):
+        """
+        Connected to QThread.finished — Qt's own authoritative signal that
+        the underlying OS thread has actually exited. This is the ONLY
+        place allowed to treat the worker as safely stopped after an
+        abort. If the worker finished normally (not via abort),
+        _on_done() has already run via done_signal (which is emitted just
+        before the thread function returns, so it always arrives first).
+        """
+        print("[THREAD] SelfTestWorker FINISHED")
+        if self._stopping_poll_timer is not None:
+            self._stopping_poll_timer.stop()
+
+        if not self._abort_requested:
+            return   # normal completion path — _on_done already handled everything
 
         import core.dmm_reader as _dmm_module
-        _dmm_module.force_reset_dmm_state()
+        try:
+            _dmm_module.force_reset_dmm_state()
+        except Exception:
+            pass
 
+        # SELF-TEST ABORT SAFETY: the test worker has fully stopped (Qt
+        # `finished`), so nothing is still issuing relay commands. Now OFF
+        # every relay registered for this test, with a real progress bar.
+        self._run_abort_relay_cleanup()
+
+        # Worker's own finally-block cleanup (_cleanup_after_test) already
+        # ran inside run() before this signal fired — this is a second,
+        # idempotent safety pass from the dialog side in case the worker
+        # was killed by something other than a clean abort (should not
+        # happen anymore, but costs nothing to double-check).
         self._resume_listeners_after_abort()
 
         self.test_completed = True
         self.test_result = "ABORTED"
         self.save_btn.setEnabled(True)
+        self.close_btn.setEnabled(True)
         self.close_btn.setText("Close")
+        # Stays the same red as the original "Abort Test" button — an
+        # aborted run's Close button shouldn't look identical to a normal
+        # completion's, since it's confirming a cancelled run, not success.
         self.close_btn.setStyleSheet("""
             QPushButton {
-                background-color: #45475a; color: white;
+                background-color: #c62828; color: white;
                 border-radius: 4px; padding: 8px 14px; border: none;
             }
-            QPushButton:hover { background-color: #585b70; }
+            QPushButton:hover { background-color: #b71c1c; }
         """)
+        # NEW — replace the last "Still waiting..." line with the real
+        # result instead of leaving the log looking stuck at (Ns).
+        self._update_stopping_line("[ABORT] Worker stopped safely — you can close this dialog.")
+        print("[ABORT] Worker stopped safely — you can now close this dialog.")
+        
+    def _run_abort_relay_cleanup(self):
+        """
+        SELF-TEST ABORT SAFETY:
+        Every relay registered for the current test receives an OFF command
+        after a confirmed abort, regardless of which relays software thinks
+        are ON. Runs only once the test worker thread has stopped, and never
+        power-cycles CH3 or replays relay commands.
+        """
+        if self._abort_cleanup_done:
+            return
+        self._abort_cleanup_done = True
+        from core.self_test_relay_manager import (
+            relays_for_device, AbortRelayCleanupDialog,
+        )
+        w = self._worker
+        current = getattr(w, "_current_device_name", None)
+        if current is None:
+            current = w.device_name if not w.all_devices else None
+        relays = relays_for_device(current) if current else []
+        if not relays:
+            return   # e.g. Ethernet/RS232/RS422 or aborted before any device started
+        dlg = AbortRelayCleanupDialog(relays, parent=self)
+        dlg.exec_()
+        if dlg.failed:
+            self._append(
+                "[ABORT] Ran into a problem turning all channels off. "
+                "Failed relay(s): " + ", ".join(dlg.failed), True)
+        else:
+            self._append("[ABORT] All registered relays switched OFF.", False)
 
     def _resume_listeners_after_abort(self):
         """Abort just stops the running test in place — no PSU channel
@@ -3344,40 +4205,58 @@ class SelfTestDialog(QDialog):
                     lst.resume()
                 except Exception:
                     pass
-            self._append("[ABORT] Device listeners resumed", False)
+            # terminate() kills SelfTestWorker's thread outright — its own
+            # finally block (which would normally restart this timer and
+            # clear MCU UI suppression) never runs. Without restarting the
+            # timer here, "Microcontroller" can be left in
+            # _disconnected_devices with nothing in the system left to
+            # ever re-check it, permanently stuck on "Not Connected" even
+            # after CH3/ISTJ are actually fine again.
+            try:
+                monitor._reconnect_timer.start()
+            except Exception:
+                pass
+            try:
+                monitor.resume_mcu_ui_signals()
+            except Exception:
+                pass
+            print("[ABORT] Device listeners resumed")
 
         try:
-            from core import apx_reader
-            apx = apx_reader.get_apx()
+            from devices.apx_analyzer import get_apx
+            apx = get_apx()
             if apx is not None:
                 apx.BenchMode.Generator.On = False
                 try:
                     apx.AudibleSignalMonitor.Enabled = False
                 except Exception:
                     pass
-                self._append("[ABORT] APX generator turned OFF", False)
+                print("[ABORT] APX generator turned OFF")
         except Exception as e:
-            self._append(f"[ABORT] APX generator shutdown skipped (non-fatal): {e}", False)
+            print(f"[ABORT] APX generator shutdown skipped (non-fatal): {e}")
 
 class DisconnectToast(QWidget):
     """
-    Non-blocking, non-modal disconnect notification.
+    Non-blocking, non-modal disconnect/reconnect notification.
     Appears in the top-right of the parent window, auto-dismisses after 6 s,
     or when the user clicks the X button. Never touches the main thread event loop.
     """
-    def __init__(self, title: str, body: str, parent=None):
+    def __init__(self, title: str, body: str, parent=None, severity: str = "error"):
         super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.setAttribute(Qt.WA_ShowWithoutActivating)   # ← KEY: never steals focus
 
+        accent = "#d32f2f" if severity == "error" else "#2e7d32"   # NEW
+        icon = "⚠" if severity == "error" else "✓"                 # NEW
+
         self.setFixedWidth(320)
-        self.setStyleSheet("""
-            QWidget {
+        self.setStyleSheet(f"""
+            QWidget {{
                 background-color: #1e1e2e;
-                border: 1px solid #d32f2f;
+                border: 1px solid {accent};
                 border-radius: 8px;
-            }
-            QLabel { border: none; background: transparent; }
+            }}
+            QLabel {{ border: none; background: transparent; }}
         """)
 
         layout = QVBoxLayout(self)
@@ -3386,11 +4265,11 @@ class DisconnectToast(QWidget):
 
         # Title row
         title_row = QHBoxLayout()
-        icon_lbl = QLabel("⚠")
-        icon_lbl.setStyleSheet("color:#d32f2f; font-size:14px;")
+        icon_lbl = QLabel(icon)
+        icon_lbl.setStyleSheet(f"color:{accent}; font-size:14px;")
         title_lbl = QLabel(title)
         title_lbl.setFont(QFont("Arial", 9, QFont.Bold))
-        title_lbl.setStyleSheet("color:#f38ba8;")
+        title_lbl.setStyleSheet(f"color:{accent};")
         close_btn = QPushButton("✕")
         close_btn.setFixedSize(20, 20)
         close_btn.setStyleSheet("""

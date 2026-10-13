@@ -42,6 +42,13 @@ class ConnectionWorker(QThread):
         """
         time.sleep(0.5)
         
+                # ── Close stale APx session before attempting fresh connect ──────
+        try:
+            from devices.apx_analyzer import close_apx
+            close_apx()
+            print("APx previous session closed ✓")
+        except Exception:
+            pass  # No previous session or close_apx not yet implemented — safe to ignore
         
         # ===== POWER SUPPLY (REAL VISA DISCOVERY) =====
         self.log_signal.emit("Searching for Power Supply...", False)
@@ -111,14 +118,14 @@ class ConnectionWorker(QThread):
             self.device_status["Oscilloscope"] = False
             self.oscilloscope_found = False
 
-        # ── Close stale APx session before attempting fresh connect ──────
-        try:
-            from devices.apx_analyzer import close_apx
-            close_apx()
-            self.log_signal.emit("APx previous session closed ✓", False)
-        except Exception:
-            pass  # No previous session or close_apx not yet implemented — safe to ignore
-        
+
+
+        # Give APx500 a moment to fully release before relaunching —
+        # closing and immediately reconnecting was racing the old
+        # process's shutdown, which is why it sometimes took 2 retries
+        # before APx500 came up cleanly.
+        time.sleep(1)
+
         # ===== AUDIO ANALYZER (APX525) =====
         self.log_signal.emit("Searching for Audio Analyzer (APx525)...", False)
 

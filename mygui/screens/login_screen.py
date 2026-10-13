@@ -93,7 +93,167 @@ FAQ_DATA = [
      "a": "Contact your system administrator or the Zing Technologies support team.",
      "icon": "troubleshooting"},
 ]
+alert_icon_path = str(RESOURCES_DIR / "alert.png")   # the shield-! icon you attached
 
+ALERT_PALETTES = {
+    "security": {  # wrong password — genuine credential failure
+        "grad": ("#3d0a0a", "#7a1414"), "border": "#f3b4b4",
+        "label": "SECURITY\nACCESS CONTROL", "accent": "#ff5a5a",
+        "sub_color": "#e0a0a0", "heading_color": "#dc2626",
+    },
+    "unregistered": {  # name not found — routing issue, not a breach
+        "grad": ("#0a1f3d", "#14407a"), "border": "#b4d3f3",
+        "label": "ACCOUNT\nNOT FOUND", "accent": "#5ab0ff",
+        "sub_color": "#a0c8e0", "heading_color": "#1a5da8",
+    },
+    "conflict": {  # duplicate registration — data conflict, not a threat
+        "grad": ("#3d2c0a", "#7a5a14"), "border": "#f3d9a8",
+        "label": "REGISTRATION\nCONFLICT", "accent": "#ffb84d",
+        "sub_color": "#e0c090", "heading_color": "#b45309",
+    },
+}
+
+class AlertPopup(QDialog):
+    """
+    Two-pane styled alert (colored panel + message panel).
+    kind selects the palette: 'security' | 'unregistered' | 'conflict'.
+    """
+    def __init__(self, parent, heading, message, bullets=None,
+                 footer_note=None, kind="security"):
+        super().__init__(parent, Qt.Dialog | Qt.FramelessWindowHint)
+        self.setModal(True)
+        self.setFixedSize(700, 320)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+        pal = ALERT_PALETTES.get(kind, ALERT_PALETTES["security"])
+        if footer_note is None:
+            footer_note = {
+                "security": "AUTHORISED PERSONNEL ONLY",
+                "unregistered": "NEW USER? REGISTER BELOW",
+                "conflict": "DATA INTEGRITY CHECK",
+            }.get(kind, "AUTHORISED PERSONNEL ONLY")
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        card = QFrame()
+        card.setStyleSheet(f"""
+            QFrame {{ background: white; border: 1px solid {pal['border']}; border-radius: 14px; }}
+        """)
+        card_layout = QHBoxLayout(card)
+        card_layout.setContentsMargins(0, 0, 0, 0)
+        card_layout.setSpacing(0)
+        outer.addWidget(card)
+
+        # ── Left red security panel ──
+        left = QFrame()
+        left.setFixedWidth(240)
+        g1, g2 = pal["grad"]
+        left.setStyleSheet(f"""
+            QFrame {{
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {g1}, stop:1 {g2});
+                border-top-left-radius: 14px; border-bottom-left-radius: 14px;
+            }}
+            QLabel {{ background: transparent; border: none; }}
+        """)
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(24, 24, 24, 24)
+
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(QIcon(alert_icon_path).pixmap(72, 72))
+        icon_lbl.setAlignment(Qt.AlignCenter)
+        left_layout.addWidget(icon_lbl)
+        left_layout.addStretch()
+
+        sec_title = QLabel(pal["label"])
+        sec_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        sec_title.setStyleSheet(f"color:{pal['accent']}; letter-spacing:1px;")
+        left_layout.addWidget(sec_title)
+
+        sec_line = QFrame()
+        sec_line.setFixedSize(40, 2)
+        sec_line.setStyleSheet(f"background:{pal['accent']};")
+        left_layout.addWidget(sec_line)
+        left_layout.addSpacing(6)
+
+        sec_sub = QLabel("HAL  |  ZING TECHNOLOGIES")
+        sec_sub.setFont(QFont("Segoe UI", 7))
+        sec_sub.setStyleSheet(f"color:{pal['sub_color']};")
+        left_layout.addWidget(sec_sub)
+
+        card_layout.addWidget(left)
+
+        # ── Right message panel ──
+        right = QWidget()
+        right.setStyleSheet("QLabel { border: none; }")
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(28, 20, 28, 20)
+        right_layout.setSpacing(10)
+
+        top_row = QHBoxLayout()
+        head_lbl = QLabel(heading)
+        head_lbl.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        head_lbl.setStyleSheet(f"color:{pal['heading_color']}; letter-spacing:1px; border:none;")
+        top_row.addWidget(head_lbl)
+        top_row.addStretch()
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(24, 24)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setStyleSheet(
+            "QPushButton{border:none;background:transparent;color:#888;font-size:14px;}"
+            "QPushButton:hover{color:#dc2626;}"
+        )
+        close_btn.clicked.connect(self.reject)
+        top_row.addWidget(close_btn)
+        right_layout.addLayout(top_row)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color:#eee;")
+        right_layout.addWidget(sep)
+
+        msg_lbl = QLabel(message)
+        msg_lbl.setWordWrap(True)
+        msg_lbl.setFont(QFont("Segoe UI", 13, QFont.Bold))
+        msg_lbl.setStyleSheet("color:#14213d; border:none;")
+        right_layout.addWidget(msg_lbl)
+
+        if bullets:
+            box = QFrame()
+            box.setStyleSheet("QFrame{background:#fdecec; border-radius:8px;}")
+            box_layout = QVBoxLayout(box)
+            box_layout.setContentsMargins(14, 10, 14, 10)
+            box_layout.setSpacing(4)
+            for b in bullets:
+                b_lbl = QLabel(f"•  {b}")
+                b_lbl.setWordWrap(True)
+                b_lbl.setFont(QFont("Segoe UI", 9))
+                b_lbl.setStyleSheet("color:#8a2222; border:none;")
+                box_layout.addWidget(b_lbl)
+            right_layout.addWidget(box)
+
+        right_layout.addStretch()
+
+        bottom_row = QHBoxLayout()
+        note_lbl = QLabel(footer_note)
+        note_lbl.setFont(QFont("Segoe UI", 7))
+        note_lbl.setStyleSheet("color:#b0b0b0; letter-spacing:0.5px;")
+        bottom_row.addWidget(note_lbl)
+        bottom_row.addStretch()
+
+        ok_btn = QPushButton("OK   ›")
+        ok_btn.setCursor(Qt.PointingHandCursor)
+        ok_btn.setMinimumSize(110, 38)
+        ok_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        ok_btn.setStyleSheet("""
+            QPushButton { background:#14213d; color:white; border:none; border-radius:8px; }
+            QPushButton:hover { background:#0d1730; }
+        """)
+        ok_btn.clicked.connect(self.accept)
+        bottom_row.addWidget(ok_btn)
+        right_layout.addLayout(bottom_row)
+
+        card_layout.addWidget(right, 1)
 
 class AboutPopup(QDialog):
     def __init__(self, parent, anchor_widget):
@@ -678,7 +838,7 @@ class LoginScreen(QMainWindow):
             self.show_login_inline()
 
         except Exception:
-            QMessageBox.warning(self, "Error", "An employee with this name already exists.")
+            self.show_duplicate_employee_error(name)
         finally:
             conn.close()
     
@@ -1079,22 +1239,23 @@ class LoginScreen(QMainWindow):
         conn = sqlite3.connect(EMPLOYEE_DB_PATH)
         cur = conn.cursor()
 
-        cur.execute(
-            "SELECT * FROM employees WHERE name=? AND emp_id=?",
-            (name, emp_id)
-        )
+        cur.execute("SELECT emp_id FROM employees WHERE name=?", (name,))
         row = cur.fetchone()
         conn.close()
 
-        if row:
-            # ✅ WRITE SESSION FILE (OVERWRITE EVERY LOGIN)
-            with open(SESSION_FILE, "w") as f:
-                f.write(f"{name}\n")
-                f.write(f"{emp_id}\n")
-                f.write("Employee\n")
-            self.login_success.emit(name, emp_id, "Employee")
-        else:
-            self.show_error_popup("Employee not registered. Please register first.")
+        if row is None:
+            self.show_not_registered_error(name)
+            return
+
+        if row[0] != emp_id:
+            self.show_wrong_password_error(name)
+            return
+
+        with open(SESSION_FILE, "w") as f:
+            f.write(f"{name}\n")
+            f.write(f"{emp_id}\n")
+            f.write("Employee\n")
+        self.login_success.emit(name, emp_id, "Employee")
 
     def on_completer_activated(self, selected_name: str):
         """Fires on click OR Enter/arrow-key selection from the popup."""
@@ -1112,6 +1273,30 @@ class LoginScreen(QMainWindow):
         msg_box.setText(message)
         msg_box.setIcon(QMessageBox.Critical)
         msg_box.exec_()
+        
+    def show_wrong_password_error(self, name):
+        AlertPopup(
+            self, kind="security", heading="LOGIN FAILED",
+            message="Incorrect Employee ID for this account.",
+            bullets=[f"“{name}” is registered, but the ID entered doesn't match.",
+                    "Employee ID is case-sensitive."],
+        ).exec_()
+
+    def show_not_registered_error(self, name):
+        AlertPopup(
+            self, kind="unregistered", heading="NOT REGISTERED",
+            message="We couldn't find this employee.",
+            bullets=[f"No account found for “{name}”.",
+                    "Use “New Employee? Register” to create one."],
+        ).exec_()
+
+    def show_duplicate_employee_error(self, name):
+        AlertPopup(
+            self, kind="conflict", heading="ALREADY REGISTERED",
+            message="An employee with this name already exists.",
+            bullets=[f"“{name}” is already registered.",
+                    "Duplicate accounts aren't allowed — try logging in instead."],
+        ).exec_()
  
 # ============================================================================
 # EMPLOYEE REGISTER SCREEN (CLEAN VERSION - NO WINDOW INSIDE WINDOW)

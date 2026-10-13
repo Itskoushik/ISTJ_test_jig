@@ -1,8 +1,8 @@
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout
 )
-from PyQt5.QtGui import QPixmap, QFont
-from PyQt5.QtCore import Qt, QSize, QTimer
+from PyQt5.QtGui import QPixmap, QFont, QMouseEvent
+from PyQt5.QtCore import Qt, QSize, QTimer, QPoint
 
 class _SpaceSafeButton(QPushButton):
     """QPushButton that ignores the Space key entirely (never auto-clicks
@@ -128,6 +128,37 @@ class OperatorInfoPopup(QDialog):
             btn_layout.addWidget(self.no_btn)
             self.yes_btn.setFocus()
 
+        elif buttons == "retry_abort":
+            self.retry_btn = _SpaceSafeButton("🔁 Retry")
+            self.retry_btn.setFixedSize(190, 38)
+            self.retry_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            self.retry_btn.setFocusPolicy(Qt.StrongFocus)
+            self.retry_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #2e7d32; color: white;
+                    border: 1px solid #1b5e20; border-radius: 2px;
+                }
+                QPushButton:hover { background-color: #1b5e20; }
+            """)
+            self.retry_btn.clicked.connect(self._on_yes)
+
+            self.abort_btn = _SpaceSafeButton("✖ Abort")
+            self.abort_btn.setFixedSize(140, 38)
+            self.abort_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            self.abort_btn.setFocusPolicy(Qt.StrongFocus)
+            self.abort_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #d32f2f; color: white;
+                    border: 1px solid #b71c1c; border-radius: 2px;
+                }
+                QPushButton:hover { background-color: #b71c1c; }
+            """)
+            self.abort_btn.clicked.connect(self._on_no)
+
+            btn_layout.addWidget(self.retry_btn)
+            btn_layout.addWidget(self.abort_btn)
+            self.retry_btn.setFocus()
+
         elif buttons == "acknowledge":
             self.ack_btn = _SpaceSafeButton("I Acknowledge")
             self.ack_btn.setFixedSize(160, 38)
@@ -162,6 +193,27 @@ class OperatorInfoPopup(QDialog):
 
         btn_layout.addStretch()
         main_layout.addLayout(btn_layout)
+
+        # ── Drag-anywhere support ──────────────────────────────────────
+        self._drag_pos = None
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton:
+            self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if self._drag_pos is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPos() - self._drag_pos)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        self._drag_pos = None
+        super().mouseReleaseEvent(event)
 
     def _update_timer(self):
         if self.remaining_time > 0:
@@ -199,6 +251,11 @@ class OperatorInfoPopup(QDialog):
                     self.no_btn.setFocus()
                 else:
                     self.yes_btn.setFocus()
+            elif hasattr(self, "retry_btn") and hasattr(self, "abort_btn"):
+                if self.retry_btn.hasFocus():
+                    self.abort_btn.setFocus()
+                else:
+                    self.retry_btn.setFocus()
             return
 
         # Tab / Shift+Tab move focus normally.

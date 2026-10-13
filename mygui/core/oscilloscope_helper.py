@@ -295,14 +295,12 @@ def osc_write_with_recovery(screen, command: str) -> None:
                 time.sleep(_OSC_SOFT_RETRY_DELAY_S)
                 continue
 
-            screen.log_signal.emit(
-                f"⚠ Oscilloscope communication lost while sending '{command}'.", True
-            )
+            print(f"[OSC] Communication lost while sending '{command}': {exc}")
             try:
                 conn.instrument = None  # mark the session stale
             except Exception:
                 pass
-            screen.log_signal.emit(f"↻ Retrying Oscilloscope operation: {command}", False)
+            print(f"[OSC] Retrying Oscilloscope operation: {command}")
             soft_attempts = 0
             # loop → ensure_oscilloscope_connected() detects the stale
             # session and runs the full popup/reconnect cycle again

@@ -98,18 +98,48 @@ def _set_col(col_off):
     if col_off:
         next_column(col_off)
 
+def _relay_reset(screen):
+    """Close APx, reset relays to configured default state. Raises on failure."""
+    close_apx()
+    time.sleep(1)
+    screen.check_abort()
+    screen.log_signal.emit("Switching all Relays to Default state", False)
+    if STM32RelayController.send_with_retry(STM32RelayController.set_default_states):
+        screen.log_signal.emit("All relays successfully set to default states", False)
+    else:
+        screen.log_signal.emit("ERROR: Failed to set all relays to default states", True)
+        raise RuntimeError("Relay default-state reset failed - aborting test run")
+    time.sleep(1)
 
+
+def _has_non_ps_user_tests(screen):
+    """True if any selected test is neither Ground Crew nor Power Supply."""
+    for t in screen.selected_tests:
+        parent = (t.split("::")[0] if "::" in t else t).strip()
+        if parent not in _GROUND_CREW_PARENTS and parent != "POWER SUPPLY TEST":
+            return True
+    return False
+
+
+def _connect_s27(screen):
+    if STM32RelayController.send_with_retry(STM32RelayController.set_s27_on):
+        screen.log_signal.emit("STBY SWITCH S27 successfully Connected", False)
+    else:
+        screen.log_signal.emit("ERROR: Failed to Connect STBY SWITCH S27", True)
+    QApplication.processEvents()
+    time.sleep(0.5)
+    
 # ---------------------------------------------------------------------------
 # Single-connector NORM run
 # Precondition: column context already set by caller.
 # ---------------------------------------------------------------------------
 
-def _run_norm_for_connector(screen, connector):
+def _run_norm_for_connector(screen, connector, include_ps=True):
     col_off, cvr_on, cvr_off, cvr_label, tx_row, rx_row = _CONNECTOR_META[connector]
 
     screen.check_abort()
 
-    if should_run(screen, "POWER SUPPLY TEST", None):
+    if include_ps and should_run(screen, "POWER SUPPLY TEST", None):
         power_supply.run_norm(screen)
     time.sleep(1)
     screen.check_abort()
@@ -205,12 +235,12 @@ def _run_norm_for_connector(screen, connector):
 # Precondition: column context already set by caller.
 # ---------------------------------------------------------------------------
 
-def _run_stby_for_connector(screen, connector):
+def _run_stby_for_connector(screen, connector, include_ps=True):
     col_off, cvr_on, cvr_off, cvr_label, tx_row, rx_row = _CONNECTOR_META[connector]
 
     screen.check_abort()
 
-    if should_run(screen, "POWER SUPPLY TEST", None):
+    if include_ps and should_run(screen, "POWER SUPPLY TEST", None):
         power_supply.run_stby(screen)
     time.sleep(1)
     screen.check_abort()
@@ -353,7 +383,40 @@ def _run_ground_crew(screen, mode: str, row_offset=0):
             ground_crew_cvr_output.run_stby(screen)
         time.sleep(1)
 
+def _run_ground_crew_configs(screen):
+    """Four Ground Crew configurations with the cable already connected:
+    NORM/S27 OFF, STBY/S27 OFF, NORM/S27 ON (row +44), STBY/S27 ON (row +44).
+    Only selected Ground Crew tests run (filtering is inside _run_ground_crew)."""
 
+    # 1. NORMAL — S27 OFF
+    _relay_reset(screen)
+    box_init.run_init_jbox(screen)
+    screen.log_signal.emit("==========GROUND CREW TESTS — NORMAL MODE (SS OFF)==========", False)
+    _run_ground_crew(screen, "norm")
+    screen.log_signal.emit("==========COMPLETED GROUND CREW TESTS IN NORMAL MODE (SS OFF)==========", False)
+
+    # 2. STBY — S27 OFF
+    _relay_reset(screen)
+    box_init.run_init_jbox_stby(screen)
+    screen.log_signal.emit("==========GROUND CREW TESTS — STANDBY MODE (SS OFF)==========", False)
+    _run_ground_crew(screen, "stby")
+    screen.log_signal.emit("==========COMPLETED GROUND CREW TESTS IN STANDBY MODE (SS OFF)==========", False)
+
+    # 3. NORMAL — S27 ON
+    _relay_reset(screen)
+    box_init.run_init_jbox(screen)
+    _connect_s27(screen)
+    screen.log_signal.emit("==========GROUND CREW TESTS — NORMAL MODE (SS ON)==========", False)
+    _run_ground_crew(screen, "norm", row_offset=44)
+    screen.log_signal.emit("==========COMPLETED GROUND CREW TESTS IN NORMAL MODE (SS ON)==========", False)
+
+    # 4. STBY — S27 ON
+    _relay_reset(screen)
+    box_init.run_init_jbox_stby(screen)
+    _connect_s27(screen)
+    screen.log_signal.emit("==========GROUND CREW TESTS — STANDBY MODE (SS ON)==========", False)
+    _run_ground_crew(screen, "stby", row_offset=44)
+    screen.log_signal.emit("==========COMPLETED GROUND CREW TESTS IN STANDBY MODE (SS ON)==========", False)
 # ---------------------------------------------------------------------------
 # Per-connector NORM + STBY cycle
 # ---------------------------------------------------------------------------
@@ -401,9 +464,10 @@ def _run_ground_crew_only(screen, connector):
         screen.log_signal.emit("ERROR: Failed to set all relays to default states", True)
     time.sleep(1)
 
-
     box_init.run_init_jbox_stby(screen)
     screen.log_signal.emit("==========GROUND CREW TESTS — STANDBY MODE (SS OFF)==========", False)
+    _run_ground_crew(screen, "stby")          
+    screen.log_signal.emit("==========COMPLETED GROUND CREW TESTS IN STANDBY MODE (SS OFF)==========", False)  
 
     # ══════════════════════════════════════════
     #  SS ON — S27 ON, row offset +44
@@ -479,36 +543,27 @@ def _run_ground_crew_only(screen, connector):
     screen.check_abort()
 def _run_connector_pair(screen, connector, is_first_connector):
     """
-    Full NORM → STBY cycle for one connector.
-
-    Uniform behaviour for ALL connectors in BOTH modes:
-      • NORM: relay-reset + box_init.run_init_jbox before tests
-      • STBY: relay-reset + box_init.run_init_jbox_stby before tests
-
-    Ground-crew tests run immediately after the STBY of the FIRST selected
-    connector (new requested behaviour).  The "connect to any connector" popup
-    replaces what was previously a disconnect popup for that connector,
-    matching the old code where J107 had no disconnect popup before ground crew.
+    One connection session for a connector:
+      reset → connect → [PS NORM → reset/init STBY → PS STBY]
+      → [Ground Crew x4, first connector only]
+      → [reset/init NORM → user NORM → reset/init STBY → user STBY]
+      → reset → disconnect.
+    Phases with nothing selected are skipped (including their init).
     """
     col_off = _CONNECTOR_META[connector][0]
 
-    # ════════════════════════════════════════════
-    #  N O R M   entry
-    # ════════════════════════════════════════════
+    run_ps = should_run(screen, "POWER SUPPLY TEST", None)
+    run_gc = is_first_connector and _has_ground_crew_tests(screen)
+    run_user = _has_non_ps_user_tests(screen)
 
-    # Relay reset before NORM: only needed for the very first connector
+    if not (run_ps or run_gc or run_user):
+        screen.log_signal.emit(f"No tests selected for {connector} — skipping.", False)
+        return
+
+    # ── Reset (first connector only), then connect ──
+    # Later connectors were already reset at the end of the previous one.
     if is_first_connector:
-        close_apx()
-        time.sleep(0.5)
-        screen.check_abort()
-        screen.log_signal.emit("Switching all Relays to Default state", False)
-        if STM32RelayController.send_with_retry(STM32RelayController.set_default_states):
-            screen.log_signal.emit("All relays successfully set to default states", False)
-        else:
-            screen.log_signal.emit("ERROR: Failed to set all relays to default states", True)
-        time.sleep(1)
-
-    # Connect cable for NORM
+        _relay_reset(screen)
     screen.check_abort()
     screen.operator_event.clear()
     screen.show_popup_signal.emit(
@@ -520,54 +575,53 @@ def _run_connector_pair(screen, connector, is_first_connector):
     time.sleep(1)
     screen.check_abort()
 
-    # Box init for NORM: ALL connectors (same as STBY)
-    box_init.run_init_jbox(screen)
+    # ── Power Supply NORM + STBY (only if selected) ──
+    if run_ps:
+        box_init.run_init_jbox(screen)
+        time.sleep(1)
+        _set_col(col_off)
+        power_supply.run_norm(screen)
+        time.sleep(1)
+        screen.check_abort()
 
-    # Run NORM tests
-    screen.log_signal.emit(f"==========COMMENCING NORMAL MODE — {connector}==========", False)
-    _set_col(col_off)
-    _run_norm_for_connector(screen, connector)
-    screen.log_signal.emit(f"==========COMPLETED NORMAL MODE — {connector}==========", False)
-    # ════════════════════════════════════════════
-    #  S T B Y   entry
-    #  Cable stays connected — same port as NORM.
-    #  Just reset relays and re-init for STBY mode.
-    # ════════════════════════════════════════════
-    
-    close_apx()
-    time.sleep(0.5)
-    screen.check_abort()
-    screen.log_signal.emit(f"==========COMMENCING STANDBY MODE — {connector}==========", False)
-    # Relay reset before STBY
-    screen.log_signal.emit("Switching all Relays to Default state", False)
-    if STM32RelayController.send_with_retry(STM32RelayController.set_default_states):
-        screen.log_signal.emit("All relays successfully set to default states", False)
-    else:
-        screen.log_signal.emit("ERROR: Failed to set all relays to default states", True)
-    time.sleep(1)
+        _relay_reset(screen)
+        box_init.run_init_jbox_stby(screen)
+        time.sleep(1)
+        _set_col(col_off)
+        power_supply.run_stby(screen)
+        time.sleep(1)
+        screen.check_abort()
 
-    # Box init for STBY: ALL connectors
-    box_init.run_init_jbox_stby(screen)
-    time.sleep(1)
+    # ── Ground Crew: four configurations, once, first connector only ──
+    if run_gc:
+        screen.log_signal.emit(f"========== GROUND CREW — CONNECTOR {connector} ==========", False)
+        _run_ground_crew_configs(screen)
 
-    _set_col(col_off)
-    _run_stby_for_connector(screen, connector)
-    screen.log_signal.emit(f"==========COMPLETED STANDBY MODE — {connector}==========", False)
-    # ════════════════════════════════════════════
-    #  Post-STBY: ground crew OR disconnect
-    # ════════════════════════════════════════════
+    # ── Remaining user tests (PS excluded — already run above) ──
+    if run_user:
+        # Relays are already at default when PS/GC didn't run: the first connector
+        # was reset at the top, later ones at the end of the previous session.
+        if run_ps or run_gc:
+            _relay_reset(screen)
+        else:
+            screen.check_abort()   # _relay_reset normally does this
+        box_init.run_init_jbox(screen)
+        time.sleep(1)
+        screen.log_signal.emit(f"==========COMMENCING NORMAL MODE — {connector}==========", False)
+        _set_col(col_off)
+        _run_norm_for_connector(screen, connector, include_ps=False)
+        screen.log_signal.emit(f"==========COMPLETED NORMAL MODE — {connector}==========", False)
 
-    # Post-STBY: always disconnect — ground crew now runs once, up front,
-    # before the connector loop (see run()).
-    close_apx()
-    time.sleep(0.5)
-    screen.check_abort()
-    screen.log_signal.emit("Switching all Relays to Default state", False)
-    if STM32RelayController.send_with_retry(STM32RelayController.set_default_states):
-        screen.log_signal.emit("All relays successfully set to default states", False)
-    else:
-        screen.log_signal.emit("ERROR: Failed to set all relays to default states", True)
-    time.sleep(1)
+        _relay_reset(screen)
+        box_init.run_init_jbox_stby(screen)
+        time.sleep(1)
+        screen.log_signal.emit(f"==========COMMENCING STANDBY MODE — {connector}==========", False)
+        _set_col(col_off)
+        _run_stby_for_connector(screen, connector, include_ps=False)
+        screen.log_signal.emit(f"==========COMPLETED STANDBY MODE — {connector}==========", False)
+
+    # ── Reset and disconnect ──
+    _relay_reset(screen)
     screen.check_abort()
     screen.operator_event.clear()
     screen.show_popup_signal.emit(
@@ -587,10 +641,11 @@ def _run_connector_pair(screen, connector, is_first_connector):
 
 def run(screen):
     """
-    Single entry point. For every selected connector (J103 → J107 order):
-      1. NORM tests
-      2. STBY tests
-      3. Ground-crew NORM + STBY  ← only after the VERY FIRST selected connector
+    Single entry point. For every selected connector (J103 → J107 order),
+    one connection session per connector (see _run_connector_pair):
+      1. Power Supply NORM + STBY (if selected)
+      2. Ground Crew x4 configurations (first selected connector only, if selected)
+      3. Remaining user tests NORM + STBY (PS and Ground Crew excluded)
 
     Column/row offsets are identical to the original code.
     """
@@ -604,20 +659,6 @@ def run(screen):
     if not selected:
         screen.log_signal.emit("No connectors selected — nothing to test.", True)
         return
-
-    # Case A: ground-crew tests only → run once on the first selected connector
-    if not _has_user_tests(screen):
-        connector = selected[0]
-        screen.log_signal.emit(f"========== GROUND CREW ONLY — CONNECTOR {connector} ==========", False)
-        _run_ground_crew_only(screen, connector)
-        screen.log_signal.emit("========== ALL JUNCTION BOX TESTS COMPLETED ==========", False)
-        return
-
-    # Case B: ground crew FIRST (on the first selected connector's cable),
-    # then the full NORM/STBY connector loop.
-    if _has_ground_crew_tests(screen):
-        screen.log_signal.emit(f"========== GROUND CREW — CONNECTOR {selected[0]} ==========", False)
-        _run_ground_crew_only(screen, selected[0])
 
     for idx, connector in enumerate(selected):
         is_first = (idx == 0)

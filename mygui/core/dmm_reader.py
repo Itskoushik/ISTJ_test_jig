@@ -376,20 +376,89 @@ def _selftest_recover_dmm(screen) -> bool:
 
 
 def execute_dmm_operation_for_self_test(screen, operation):
-    if _dmm is None:
-        if not ensure_dmm_connected_for_self_test(screen):
-            raise DMMOperationAborted()
-    try:
-        return operation()
-    except DMMOperationAborted:
-        raise
-    except Exception as exc:
-        if not _is_transport_error(exc):
+    """
+    Self-test-only connect/read path.
+
+    Phase 1 — silent, no operator popup: up to SILENT_ATTEMPTS tries,
+    each one reusing/rediscovering the DMM handle (log lines only) and
+    then attempting the actual read.
+
+    Phase 2 — once all silent attempts are exhausted, escalate to the
+    "DMM Disconnected — check power/USB" popup on THIS SAME reading, and
+    keep showing that popup / retrying after each operator confirmation
+    until the reading actually succeeds or the operator aborts the test.
+    A reconnect that "succeeds" (device found) does not guarantee the
+    measurement itself will — if the retried read fails again, loop back
+    to the popup instead of silently failing the reading.
+    """
+    SILENT_ATTEMPTS = 3
+    last_exc = None
+
+    # ── Phase 1: silent attempts, no popup ──────────────────────────────
+    for attempt in range(1, SILENT_ATTEMPTS + 1):
+        if _dmm is None:
+            reconnected = (
+                _selftest_probe_existing_handle(screen)
+                or _selftest_discover_rigol_usb(screen)
+            )
+            if not reconnected:
+                print(f"[DMM][SELF-TEST] Silent reconnect attempt "
+                      f"{attempt}/{SILENT_ATTEMPTS} failed — no DMM handle.")
+                continue   # next silent attempt
+
+        try:
+            return operation()
+        except DMMOperationAborted:
             raise
-        if not ensure_dmm_connected_for_self_test(screen):
+        except Exception as exc:
+            if not _is_transport_error(exc):
+                raise
+            last_exc = exc
+            print(f"[DMM][SELF-TEST] Silent attempt {attempt}/{SILENT_ATTEMPTS} "
+                  f"failed: {exc}")
+            # Force a fresh handle for the next silent attempt instead of
+            # retrying the same stale/dead one.
+            _close_dmm_handle()
+            continue
+
+    # ── Phase 2: all silent attempts exhausted — operator popup, looped ──
+    # (Terminal-only diagnostic; the popup itself is the operator-facing
+    # notification, so no separate GUI log line here.)
+    print(f"[DMM][SELF-TEST] DMM unresponsive after {SILENT_ATTEMPTS} silent "
+          f"attempts{f' ({last_exc})' if last_exc else ''}.")
+
+    while True:
+        if not _selftest_recover_dmm(screen):
             raise DMMOperationAborted()
-        print("[DMM][SELF-TEST] Retrying measurement...")
-        return operation()
+
+        print("[DMM][SELF-TEST] Retrying measurement after operator confirmation...")
+        try:
+            return operation()
+        except DMMOperationAborted:
+            raise
+        except Exception as exc:
+            if not _is_transport_error(exc):
+                raise
+            screen.log_signal.emit(
+                f"[DMM][SELF-TEST] Measurement still failing after reconnect "
+                f"({exc}) — showing recovery popup again.", True
+            )
+            _close_dmm_handle()
+            continue   # show popup again, retry again
+        except DMMOperationAborted:
+            raise
+        except Exception as exc2:
+            if not _is_transport_error(exc2):
+                raise
+            # Quiet reuse/USB-discovery reconnect above didn't actually fix
+            # the link — the retried read failed too. Escalate straight to
+            # the operator-facing popup recovery on THIS SAME reading,
+            # instead of silently giving up and only showing the popup
+            # when the next relay's read happens to fail as well.
+            if not _selftest_recover_dmm(screen):
+                raise DMMOperationAborted()
+            print("[DMM][SELF-TEST] Retrying measurement after popup recovery...")
+            return operation()
 
 
 def read_voltage_for_self_test(screen, label="Voltage", min_val=None, max_val=None):

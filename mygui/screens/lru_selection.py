@@ -123,6 +123,9 @@ class Singletestselection(QMainWindow):
     def go_back(self):
         if self.parent_window:
             self.parent_window.show()
+            app = QApplication.instance()
+            if hasattr(app, "current_screen"):
+                app.current_screen = self.parent_window
         self.close()
     
     def create_card(self, title, button_text, button_color, card_type):

@@ -179,7 +179,7 @@ class PrereqCheckDialog(QDialog):
         info_layout = QHBoxLayout(infobar)
         info_layout.setContentsMargins(28, 0, 28, 0)
 
-        info_left = QLabel("VERSION: 1.0.1-BETA")
+        info_left = QLabel("VERSION: 1.0.1 v")
         info_left.setFont(QFont("Courier", 8))
         info_left.setStyleSheet("color: #374151; background: transparent;")
         info_layout.addWidget(info_left)

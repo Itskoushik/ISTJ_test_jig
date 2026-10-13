@@ -99,7 +99,13 @@ def find_psu_specific(resource_string: str, rm=None):
 import time
 
 def turn_off_psu_channel(psu_inst, channel: int, psu_lock=None) -> bool:
-    """Turn off a single PSU channel using the EXISTING psu_inst/lock. Never opens a new connection."""
+    """Turn off a single PSU channel using the EXISTING psu_inst/lock. Never opens a new connection.
+
+    NOTE: kept for any other individual-channel caller in the codebase.
+    turn_off_all_psu_channels() below no longer calls this — it needs the
+    whole CH1→CH2→CH3 sequence under ONE lock acquisition, not one
+    acquire/release per channel.
+    """
     if psu_inst is None:
         return False
     try:
@@ -120,21 +126,75 @@ def turn_off_psu_channel(psu_inst, channel: int, psu_lock=None) -> bool:
 
 
 def turn_off_all_psu_channels(psu_inst, psu_lock=None) -> bool:
-    """Turn OFF CH1, CH2, CH3 in sequence using the EXISTING psu_inst/lock."""
+    """
+    Turn OFF CH1, CH2, CH3 as ONE atomic sequence — a single lock
+    acquisition covers every channel's OFF write AND its verification
+    read, so nothing else touching the shared PSU handle (PSUListener
+    *IDN?, STM32Listener OUTP? CH3, a stray reconnect, etc.) can
+    interleave a command between channels or between "OFF" and its
+    verification read.
+
+    Each channel is selected via INST:NSEL exactly ONCE — OFF is written
+    and then immediately verified with OUTP? before moving to the next
+    channel, instead of a full OFF pass over all channels followed by a
+    second full verification pass. Same guarantee (every OFF is read
+    back, never just trusted), half the channel-select traffic.
+
+    Never opens a new VISA connection, never calls find_psu(). If a
+    channel's OFF write or its verification raises, that channel is
+    logged and marked failed, but the remaining channels are still
+    attempted — one bad channel must not skip the others.
+    """
     if psu_inst is None:
         return False
-    all_ok = True
-    for ch in (1, 2, 3):
-        if not turn_off_psu_channel(psu_inst, ch, psu_lock=psu_lock):
-            all_ok = False
-    return all_ok
+
+    results = {1: False, 2: False, 3: False}
+
+    def _do():
+        for ch in (1, 2, 3):
+            try:
+                psu_inst.write(f"INST:NSEL {ch}")
+                time.sleep(0.05)
+                psu_inst.write("OUTP OFF")
+                time.sleep(0.05)
+                state = psu_inst.query("OUTP?").strip().upper()
+                if state in ("0", "OFF"):
+                    print(f"[PSU SHUTDOWN] CH{ch} OFF verified")
+                    results[ch] = True
+                else:
+                    print(f"[PSU SHUTDOWN] CH{ch} OFF verification FAILED (reported: {state!r})")
+                    results[ch] = False
+            except Exception as e:
+                print(f"[PSU HELPER] turn_off_all_psu_channels: CH{ch} failed: {e}")
+                results[ch] = False
+
+    if psu_lock is not None:
+        with psu_lock:
+            _do()
+    else:
+        _do()
+
+    return all(results.values())
 
 
-def turn_on_psu_channel(psu_inst, channel: int, voltage: float, current: float, psu_lock=None) -> bool:
-    """Configure and enable a single PSU channel using the EXISTING psu_inst/lock."""
+def turn_on_psu_channel(psu_inst, channel: int, voltage: float, current: float,
+                         psu_lock=None, guard=None) -> bool:
+    """
+    Configure and enable a single PSU channel using the EXISTING psu_inst/lock.
+
+    guard: optional zero-arg callable returning True if it is still safe to
+    energize the channel. Checked ONLY immediately before the physical
+    "OUTP ON" write, while holding psu_lock — a check performed before this
+    function was called (or before the lock was acquired) is not trusted,
+    since abort/disconnect can land in that gap. If guard() returns False,
+    voltage/current are still configured (harmless) but OUTP ON is skipped
+    and this function returns False.
+    """
     if psu_inst is None:
         return False
     try:
+        result = {"energized": False}
+
         def _do():
             psu_inst.write(f"INST:NSEL {channel}")
             time.sleep(0.05)
@@ -142,14 +202,22 @@ def turn_on_psu_channel(psu_inst, channel: int, voltage: float, current: float, 
             time.sleep(0.05)
             psu_inst.write(f"SOUR{channel}:CURR {current}")
             time.sleep(0.05)
+            # ── Final guard, checked immediately before the physical write,
+            # while still holding the lock. Do NOT trust any check made
+            # before this function was entered. ──
+            if guard is not None and not guard():
+                print(f"[PSU HELPER] Ch{channel} OUTP ON blocked by guard (abort/disconnect active)")
+                return
             psu_inst.write("OUTP ON")
             time.sleep(0.05)
+            result["energized"] = True
+
         if psu_lock is not None:
             with psu_lock:
                 _do()
         else:
             _do()
-        return True
+        return result["energized"]
     except Exception as e:
         print(f"[PSU HELPER] turn_on_psu_channel(Ch{channel}) failed: {e}")
         return False
